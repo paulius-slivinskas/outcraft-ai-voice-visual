@@ -23,7 +23,7 @@ const basePath =
 
 export default defineConfig({
   base: basePath,
-  plugins: [galleryFilePlugin(), react(), tailwindcss()],
+  plugins: [galleryFilePlugin(), staticGalleryBuildPlugin(), react(), tailwindcss()],
   server: {
     port: 5180,
     watch: {
@@ -51,6 +51,26 @@ function galleryFilePlugin(): Plugin {
     },
     configurePreviewServer(server) {
       server.middlewares.use(middleware);
+    },
+  };
+}
+
+function staticGalleryBuildPlugin(): Plugin {
+  let outDir = resolve(process.cwd(), "dist");
+
+  return {
+    name: "outcraft-static-gallery-build",
+    configResolved(config) {
+      outDir = resolve(config.root, config.build.outDir);
+    },
+    async closeBundle() {
+      const gallery = await readFile(galleryFilePath, "utf8").catch(() =>
+        `${JSON.stringify(defaultGalleryState, null, 2)}\n`,
+      );
+      const outputPath = resolve(outDir, "data/gallery.json");
+
+      await mkdir(dirname(outputPath), { recursive: true });
+      await writeFile(outputPath, gallery.endsWith("\n") ? gallery : `${gallery}\n`, "utf8");
     },
   };
 }

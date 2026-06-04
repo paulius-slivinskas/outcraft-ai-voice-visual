@@ -104,6 +104,7 @@ type GalleryState = {
 };
 
 const galleryApiPath = "/api/gallery";
+const staticGalleryPath = "data/gallery.json";
 const legacyGalleryStorageKey = "outcraft.gallery.v1";
 const themeStorageKey = "outcraft.ui-theme.v1";
 const sampleAudioPath =
@@ -4330,26 +4331,52 @@ function slugify(value: string) {
 }
 
 async function readGalleryState(): Promise<GalleryState> {
-  const response = await fetch(galleryApiPath, {
-    headers: { Accept: "application/json" },
-  });
+  const apiGalleryState = await fetchGalleryState(galleryApiPath);
 
-  if (!response.ok) {
-    throw new Error("Gallery file could not be loaded.");
+  if (apiGalleryState) {
+    return apiGalleryState;
   }
 
-  return normalizeGalleryState(await response.json());
+  const staticGalleryState = await fetchGalleryState(staticGalleryPath);
+
+  if (staticGalleryState) {
+    return staticGalleryState;
+  }
+
+  throw new Error("Gallery file could not be loaded.");
 }
 
 async function writeGalleryState(state: GalleryState): Promise<void> {
-  const response = await fetch(galleryApiPath, {
-    body: JSON.stringify(state),
-    headers: { "Content-Type": "application/json" },
-    method: "PUT",
-  });
+  try {
+    const response = await fetch(galleryApiPath, {
+      body: JSON.stringify(state),
+      headers: { "Content-Type": "application/json" },
+      method: "PUT",
+    });
 
-  if (!response.ok) {
-    throw new Error("Gallery file could not be saved.");
+    if (response.ok) {
+      return;
+    }
+  } catch {
+    // Static hosts such as GitHub Pages cannot write to /api/gallery.
+  }
+
+  writeLegacyGalleryState(state);
+}
+
+async function fetchGalleryState(path: string): Promise<GalleryState | null> {
+  try {
+    const response = await fetch(path, {
+      headers: { Accept: "application/json" },
+    });
+
+    if (!response.ok) {
+      return null;
+    }
+
+    return normalizeGalleryState(await response.json());
+  } catch {
+    return null;
   }
 }
 
@@ -4371,6 +4398,17 @@ function readLegacyGalleryState(): GalleryState | null {
   } catch {
     return null;
   }
+}
+
+function writeLegacyGalleryState(state: GalleryState) {
+  if (typeof window === "undefined") {
+    throw new Error("Gallery file could not be saved.");
+  }
+
+  window.localStorage.setItem(
+    legacyGalleryStorageKey,
+    JSON.stringify(normalizeGalleryState(state)),
+  );
 }
 
 function mergeGalleryStates(
