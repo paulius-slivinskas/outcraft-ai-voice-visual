@@ -1,0 +1,66 @@
+.demo-screen {
+  position: fixed;
+  inset: 0;
+  width: 100vw;
+  height: 100vh;
+  overflow: hidden;
+  background: #03080f;
+  cursor: none;
+}
+
+.demo-visual-layer {
+  position: absolute;
+  inset: 0;
+  z-index: 1;
+  overflow: hidden;
+  animation: demo-visual-reveal 1800ms ease both;
+}
+
+.demo-vignette {
+  position: absolute;
+  inset: 0;
+  z-index: 2;
+  background:
+    radial-gradient(circle at center, transparent 48%, rgb(0 0 0 / 0.2) 100%),
+    linear-gradient(180deg, rgb(0 0 0 / 0.1), transparent 24%, transparent 74%, rgb(0 0 0 / 0.12));
+  pointer-events: none;
+}
+
+.demo-center-logo {
+  position: absolute;
+  top: 50%;
+  left: 50%;
+  z-index: 4;
+  display: block;
+  width: clamp(260px, 34vw, 620px);
+  height: auto;
+  pointer-events: none;
+  user-select: none;
+  transform: translate(-50%, -50%);
+  filter: drop-shadow(0 10px 36px rgb(0 0 0 / 0.48));
+}
+
+.demo-center-logo-shadow {
+  z-index: 3;
+  opacity: 0.32;
+  transform: translate(-50%, -50%) scale(1.012);
+  filter: blur(1px);
+}
+
+@keyframes demo-visual-reveal {
+  from {
+    opacity: 0;
+    transform: scale(1.008);
+  }
+
+  to {
+    opacity: 1;
+    transform: scale(1);
+  }
+}
+
+@media (max-width: 700px) {
+  .demo-center-logo {
+    width: clamp(210px, 62vw, 420px);
+  }
+}

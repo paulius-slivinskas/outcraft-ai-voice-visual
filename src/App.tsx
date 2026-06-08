@@ -40,7 +40,6 @@ import {
   type ChangeEvent,
   type CSSProperties,
   type FormEvent,
-  type KeyboardEvent,
   type PointerEvent,
   type ReactNode,
   useEffect,
@@ -58,8 +57,6 @@ const singleFormatOptions = [
 
 const formatOptions = singleFormatOptions;
 const meshFrameMax = 500000;
-const frameScrubFramesPerPixel = 5;
-const videoDurationOptions = [15, 30, 60] as const;
 const defaultVisualOverlay: VisualOverlay = {
   asset: "waveform",
   bottomRight: "button",
@@ -72,7 +69,7 @@ const defaultVisualOverlay: VisualOverlay = {
 type FormatOption = (typeof formatOptions)[number];
 type SingleFormatOption = (typeof singleFormatOptions)[number];
 type ActiveTab = "generate" | "gallery";
-type VideoDuration = (typeof videoDurationOptions)[number];
+type VideoDuration = 15 | 30 | 60;
 type VideoExportFormat = "webm" | "mp4";
 type VideoBitratePreset = "low" | "standard" | "high";
 type VideoFrameRate = 30 | 60;
@@ -234,11 +231,11 @@ function App() {
   const [isExportingVideo, setIsExportingVideo] = useState(false);
   const [videoBitratePreset, setVideoBitratePreset] =
     useState<VideoBitratePreset>("standard");
-  const [videoDuration, setVideoDuration] = useState<VideoDuration>(15);
+  const videoDuration: VideoDuration = 15;
   const [videoExportFormat, setVideoExportFormat] =
     useState<VideoExportFormat>("mp4");
   const [videoFrameRate, setVideoFrameRate] = useState<VideoFrameRate>(30);
-  const [isVideoLoopEnabled, setIsVideoLoopEnabled] = useState(false);
+  const isVideoLoopEnabled = false;
   const [selectedVisualId, setSelectedVisualId] = useState<string | null>(null);
   const [exportFormats, setExportFormats] = useState<Set<string>>(
     () => new Set([singleFormatOptions[0].label]),
@@ -700,28 +697,6 @@ function App() {
         frame: nextFrame,
       }),
     );
-  };
-
-  const scrubFrame = (deltaFrames: number) => {
-    if (!isPaused || deltaFrames === 0) {
-      return;
-    }
-
-    setFrameOffset((currentOffset) => {
-      const nextOffset = currentOffset + deltaFrames;
-      const nextFrame = clampFrame(pausedFrame + nextOffset);
-
-      setTimelineFrame(nextFrame);
-
-      setMesh((currentMesh) =>
-        normalizeMesh({
-          ...currentMesh,
-          frame: nextFrame,
-        }),
-      );
-
-      return nextFrame - pausedFrame;
-    });
   };
 
   const captureCurrentVisual = () => {
@@ -2361,157 +2336,6 @@ function spectrumToLevel(spectrum: number[]) {
   );
 }
 
-type ExportControlProps = {
-  isExportingAllFormats: boolean;
-  isExportingVideo: boolean;
-  isVideoLoopEnabled: boolean;
-  onExportPng: (scale: 1 | 2) => void;
-  onExportVideo: (format: VideoExportFormat) => void;
-  onToggleVideoLoop: () => void;
-  onVideoDurationChange: (duration: VideoDuration) => void;
-  videoDuration: VideoDuration;
-};
-
-function ExportControl({
-  isExportingAllFormats,
-  isExportingVideo,
-  isVideoLoopEnabled,
-  onExportPng,
-  onExportVideo,
-  onToggleVideoLoop,
-  onVideoDurationChange,
-  videoDuration,
-}: ExportControlProps) {
-  const [isOpen, setIsOpen] = useState(false);
-  const menuRef = useRef<HTMLDivElement | null>(null);
-  const targetLabel = isExportingAllFormats ? "all formats" : "current format";
-
-  useEffect(() => {
-    if (!isOpen) {
-      return;
-    }
-
-    const closeOnPointerDown = (event: globalThis.PointerEvent) => {
-      if (!menuRef.current?.contains(event.target as Node)) {
-        setIsOpen(false);
-      }
-    };
-    const closeOnEscape = (event: globalThis.KeyboardEvent) => {
-      if (event.key === "Escape") {
-        setIsOpen(false);
-      }
-    };
-
-    document.addEventListener("pointerdown", closeOnPointerDown);
-    document.addEventListener("keydown", closeOnEscape);
-
-    return () => {
-      document.removeEventListener("pointerdown", closeOnPointerDown);
-      document.removeEventListener("keydown", closeOnEscape);
-    };
-  }, [isOpen]);
-
-  const runExport = (callback: () => void) => {
-    callback();
-    setIsOpen(false);
-  };
-
-  return (
-    <div className="relative min-w-0" ref={menuRef}>
-      <Button
-        aria-expanded={isOpen}
-        aria-haspopup="menu"
-        aria-label={`Export ${targetLabel}`}
-        className="w-full min-w-0 px-3"
-        disabled={isExportingVideo}
-        type="button"
-        variant="secondary"
-        onClick={() => setIsOpen((currentValue) => !currentValue)}
-      >
-        {isExportingVideo ? `Recording ${videoDuration}s` : "Export"}
-      </Button>
-      {isOpen ? (
-        <div
-          className="absolute right-0 top-[calc(100%+6px)] z-20 min-w-44 rounded-md border border-[var(--border)] bg-[var(--popover)] p-1 text-[var(--popover-foreground)] shadow-lg"
-          role="menu"
-        >
-          <div className="px-3 py-1.5 text-xs font-bold uppercase text-[var(--muted-foreground)]">
-            Image
-          </div>
-          <button
-            className="flex min-h-9 w-full items-center rounded px-3 text-left text-sm font-semibold transition hover:bg-[var(--accent)] focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-[var(--ring)]"
-            onClick={() => runExport(() => onExportPng(1))}
-            role="menuitem"
-            type="button"
-          >
-            PNG 1x
-          </button>
-          <button
-            className="flex min-h-9 w-full items-center rounded px-3 text-left text-sm font-semibold transition hover:bg-[var(--accent)] focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-[var(--ring)]"
-            onClick={() => runExport(() => onExportPng(2))}
-            role="menuitem"
-            type="button"
-          >
-            PNG 2x
-          </button>
-          <div className="my-1 h-px bg-[var(--border)]" role="separator" />
-          <div className="px-3 py-1.5 text-xs font-bold uppercase text-[var(--muted-foreground)]">
-            Video
-          </div>
-          <button
-            className="flex min-h-9 w-full items-center rounded px-3 text-left text-sm font-semibold transition hover:bg-[var(--accent)] focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-[var(--ring)]"
-            onClick={() => runExport(() => onExportVideo("webm"))}
-            role="menuitem"
-            type="button"
-          >
-            WEBM
-          </button>
-          <button
-            className="flex min-h-9 w-full items-center rounded px-3 text-left text-sm font-semibold transition hover:bg-[var(--accent)] focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-[var(--ring)]"
-            onClick={() => runExport(() => onExportVideo("mp4"))}
-            role="menuitem"
-            type="button"
-          >
-            MP4
-          </button>
-          <div className="my-1 h-px bg-[var(--border)]" role="separator" />
-          <div className="px-3 py-1.5 text-xs font-bold uppercase text-[var(--muted-foreground)]">
-            Video duration
-          </div>
-          {videoDurationOptions.map((duration) => (
-            <button
-              aria-checked={videoDuration === duration}
-              className="flex min-h-9 w-full items-center justify-between gap-3 rounded px-3 text-left text-sm font-semibold transition hover:bg-[var(--accent)] focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-[var(--ring)]"
-              key={duration}
-              onClick={() => onVideoDurationChange(duration)}
-              role="menuitemcheckbox"
-              type="button"
-            >
-              <span>{duration} seconds</span>
-              {videoDuration === duration ? (
-                <Check className="size-4" aria-hidden="true" />
-              ) : null}
-            </button>
-          ))}
-          <div className="my-1 h-px bg-[var(--border)]" role="separator" />
-          <button
-            aria-checked={isVideoLoopEnabled}
-            className="flex min-h-9 w-full items-center justify-between gap-3 rounded px-3 text-left text-sm font-semibold transition hover:bg-[var(--accent)] focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-[var(--ring)]"
-            onClick={onToggleVideoLoop}
-            role="menuitemcheckbox"
-            type="button"
-          >
-            <span>Loopable video</span>
-            {isVideoLoopEnabled ? (
-              <Check className="size-4" aria-hidden="true" />
-            ) : null}
-          </button>
-        </div>
-      ) : null}
-    </div>
-  );
-}
-
 type OverlayControlProps = {
   onChange: (overlay: VisualOverlay) => void;
   overlay: VisualOverlay;
@@ -2810,115 +2634,6 @@ function SceneDecorations({
   );
 }
 
-type FrameScrubberProps = {
-  disabled: boolean;
-  offset: number;
-  onScrub: (deltaFrames: number) => void;
-};
-
-function FrameScrubber({ disabled, offset, onScrub }: FrameScrubberProps) {
-  const isDraggingRef = useRef(false);
-  const lastClientXRef = useRef(0);
-
-  const applyPixelDelta = (pixelDelta: number) => {
-    const frameDelta = Math.round(pixelDelta * frameScrubFramesPerPixel);
-
-    if (frameDelta !== 0) {
-      onScrub(frameDelta);
-    }
-  };
-
-  const startScrub = (event: PointerEvent<HTMLDivElement>) => {
-    if (disabled) {
-      return;
-    }
-
-    isDraggingRef.current = true;
-    lastClientXRef.current = event.clientX;
-    event.currentTarget.setPointerCapture(event.pointerId);
-  };
-
-  const moveScrub = (event: PointerEvent<HTMLDivElement>) => {
-    if (!isDraggingRef.current || disabled) {
-      return;
-    }
-
-    const pixelDelta = event.clientX - lastClientXRef.current;
-    lastClientXRef.current = event.clientX;
-    applyPixelDelta(pixelDelta);
-  };
-
-  const stopScrub = (event: PointerEvent<HTMLDivElement>) => {
-    isDraggingRef.current = false;
-
-    if (event.currentTarget.hasPointerCapture(event.pointerId)) {
-      event.currentTarget.releasePointerCapture(event.pointerId);
-    }
-  };
-
-  const handleKeyDown = (event: KeyboardEvent<HTMLDivElement>) => {
-    if (disabled) {
-      return;
-    }
-
-    const step = event.shiftKey ? 100 : 10;
-
-    if (event.key === "ArrowLeft") {
-      event.preventDefault();
-      onScrub(-step);
-    }
-
-    if (event.key === "ArrowRight") {
-      event.preventDefault();
-      onScrub(step);
-    }
-  };
-
-  return (
-    <div className={cn("grid gap-2.5", disabled && "opacity-55")}>
-      <span className="flex items-center justify-between gap-4 text-sm font-semibold text-[var(--muted-foreground)]">
-        <span>Frame</span>
-        <strong className="text-xs text-[var(--primary)]">
-          {formatSignedOffset(offset)}
-        </strong>
-      </span>
-      <div
-        aria-disabled={disabled}
-        aria-label="Frame"
-        className={cn(
-          "relative h-12 overflow-hidden rounded-md border border-[var(--border)] bg-[var(--background)]/44 touch-none select-none outline-none transition focus-visible:ring-2 focus-visible:ring-[var(--ring)]",
-          disabled ? "cursor-not-allowed" : "cursor-ew-resize hover:bg-[var(--accent)]",
-        )}
-        data-frame-offset={offset}
-        data-frame-scrubber
-        onKeyDown={handleKeyDown}
-        onPointerCancel={stopScrub}
-        onPointerDown={startScrub}
-        onPointerMove={moveScrub}
-        onPointerUp={stopScrub}
-        role="button"
-        tabIndex={disabled ? -1 : 0}
-      >
-        <div className="absolute inset-y-0 left-1/2 w-px bg-[var(--primary)]/70" />
-        <div className="absolute inset-x-3 top-1/2 h-1 -translate-y-1/2 rounded-full bg-[var(--muted)]" />
-        <div className="absolute left-1/2 top-1/2 size-5 -translate-x-1/2 -translate-y-1/2 rounded-md border border-[var(--primary)] bg-[var(--background)] shadow-sm" />
-        <div className="pointer-events-none absolute inset-y-0 left-0 w-12 bg-gradient-to-r from-[var(--background)]/90 to-transparent" />
-        <div className="pointer-events-none absolute inset-y-0 right-0 w-12 bg-gradient-to-l from-[var(--background)]/90 to-transparent" />
-      </div>
-    </div>
-  );
-}
-
-function formatSignedOffset(value: number) {
-  const roundedValue = Math.round(value);
-
-  if (roundedValue > 0) {
-    return `+${roundedValue}`;
-  }
-
-  return roundedValue.toString();
-}
-
 type SwatchFieldProps = {
   activePaletteId: string;
   label: string;
@@ -2958,41 +2673,6 @@ function ThemeToggle({ onChange, value }: ThemeToggleProps) {
           </button>
         );
       })}
-    </div>
-  );
-}
-
-type FormatFieldProps = {
-  onChange: (value: FormatOption) => void;
-  value: FormatOption;
-};
-
-function FormatField({ onChange, value }: FormatFieldProps) {
-  return (
-    <div className="grid gap-2.5">
-      <span className="text-sm font-semibold text-[var(--muted-foreground)]">
-        Format
-      </span>
-      <div className="grid grid-cols-3 gap-2">
-        {formatOptions.map((option) => (
-          <Button
-            className={cn(
-              "h-auto min-h-12 flex-col gap-0.5 px-2 py-2",
-              option.label === value.label &&
-                "border-[var(--primary)] bg-[var(--primary)] text-[var(--primary-foreground)] hover:bg-[var(--primary)]/90",
-            )}
-            key={option.label}
-            onClick={() => onChange(option)}
-            type="button"
-            variant="outline"
-          >
-            <span>{option.label}</span>
-            <span className="text-[0.62rem] font-semibold opacity-70">
-              {option.name}
-            </span>
-          </Button>
-        ))}
-      </div>
     </div>
   );
 }
@@ -3463,13 +3143,6 @@ function cloneFormat(formatToClone: FormatConfig): FormatConfig {
 function getFormatOption(label: string) {
   return (
     formatOptions.find((option) => option.label === label) ?? formatOptions[0]
-  );
-}
-
-function getSingleFormatOption(label: string) {
-  return (
-    singleFormatOptions.find((option) => option.label === label) ??
-    singleFormatOptions[0]
   );
 }
 
@@ -4716,21 +4389,5 @@ function connectMonoOutput(audioContext: AudioContext, source: AudioNode) {
   merger.connect(audioContext.destination);
 }
 
-function rotateRight(values: number[], steps: number) {
-  if (values.length === 0) {
-    return values;
-  }
-
-  const normalizedSteps = ((steps % values.length) + values.length) % values.length;
-
-  if (normalizedSteps === 0) {
-    return values;
-  }
-
-  return [
-    ...values.slice(values.length - normalizedSteps),
-    ...values.slice(0, values.length - normalizedSteps),
-  ];
-}
 
 export default App;

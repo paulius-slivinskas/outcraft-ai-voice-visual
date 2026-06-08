@@ -23,6 +23,14 @@ const basePath =
 
 export default defineConfig({
   base: basePath,
+  build: {
+    rollupOptions: {
+      input: {
+        demo: resolve(process.cwd(), "demo/index.html"),
+        main: resolve(process.cwd(), "index.html"),
+      },
+    },
+  },
   plugins: [galleryFilePlugin(), staticGalleryBuildPlugin(), react(), tailwindcss()],
   server: {
     port: 5180,
