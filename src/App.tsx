@@ -448,7 +448,7 @@ function App() {
     stopVoicePlayback();
     clearAudioMeters();
     setVoiceNotice("");
-    setVideoAudioSource("none");
+    setVideoAudioSource("file");
     setAudioSource(nextAudioUrl);
     setAudioFileName(file.name);
 
