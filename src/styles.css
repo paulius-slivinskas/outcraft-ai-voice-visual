@@ -350,6 +350,7 @@ button:disabled {
   --scene-text-scale: 1;
   --waveform-amplitude-scale: 1;
   --waveform-box-scale: 1;
+  --waveform-style-box-scale: 1;
   position: relative;
   width: min(420px, calc(100vw - 48px));
   height: 200px;
@@ -767,6 +768,22 @@ button:disabled {
     drop-shadow(0 0 calc(5px + var(--overlay-audio-level) * 10px) rgb(255 255 255 / 0.42));
 }
 
+.visual-overlay-logo-only {
+  width: var(--center-logo-size, 33%);
+  max-width: none;
+}
+
+.visual-overlay-logo-only .visual-overlay-mark {
+  filter: none;
+}
+
+.visual-overlay-circle.visual-overlay-logo.visual-overlay-logo-only,
+.visual-overlay-dock.visual-overlay-logo.visual-overlay-logo-only {
+  top: 50%;
+  width: var(--center-logo-size, 33%);
+  max-width: none;
+}
+
 .scene-logo {
   top: 7.5cqh;
   left: 6cqw;
@@ -832,8 +849,14 @@ button:disabled {
 .sound-wave-overlay {
   display: block;
   position: relative;
-  width: min(78%, 520px);
-  height: min(32%, 144px);
+  width: min(
+    calc(78% * var(--waveform-style-box-scale)),
+    calc(520px * var(--waveform-style-box-scale))
+  );
+  height: min(
+    calc(32% * var(--waveform-style-box-scale)),
+    calc(144px * var(--waveform-style-box-scale))
+  );
   transform: translate(-50%, -50%);
 }
 
@@ -842,10 +865,10 @@ button:disabled {
 .format-frame-9x16 .sound-wave-overlay {
   left: 50%;
   right: auto;
-  width: calc(50cqw * var(--waveform-box-scale));
+  width: calc(50cqw * var(--waveform-box-scale) * var(--waveform-style-box-scale));
   height: min(
-    calc(32cqh * var(--waveform-box-scale)),
-    calc(144px * var(--waveform-box-scale))
+    calc(32cqh * var(--waveform-box-scale) * var(--waveform-style-box-scale)),
+    calc(144px * var(--waveform-box-scale) * var(--waveform-style-box-scale))
   );
   max-width: none;
   transform: translate(-50%, -50%);
@@ -853,8 +876,8 @@ button:disabled {
 
 .format-frame-9x16 .sound-wave-overlay {
   height: min(
-    calc(32cqh * var(--waveform-box-scale)),
-    144px
+    calc(32cqh * var(--waveform-box-scale) * var(--waveform-style-box-scale)),
+    calc(144px * var(--waveform-style-box-scale))
   );
 }
 
