@@ -25,9 +25,13 @@ export type BottomRightOverlay = "button" | "qr" | "slogan";
 
 export type OverlayTone = "light" | "dark";
 
+export type CenterLogoSize = "33" | "50";
+
 export type VisualOverlay = {
   asset: OverlayAsset;
   bottomRight: BottomRightOverlay;
+  centerLogoOnly: boolean;
+  centerLogoSize: CenterLogoSize;
   showBottomLeftSlogan: boolean;
   showBottomCta: boolean;
   showTopLogo: boolean;

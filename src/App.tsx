@@ -13,6 +13,7 @@ import { cn } from "./lib/utils";
 import type {
   BlobConfig,
   BottomRightOverlay,
+  CenterLogoSize,
   FormatConfig,
   GallerySection,
   MeshConfig,
@@ -23,6 +24,7 @@ import type {
 import {
   AudioLines,
   Check,
+  ChevronDown,
   Heart,
   Mic,
   Moon,
@@ -35,14 +37,20 @@ import {
   SlidersHorizontal,
   Sun,
   Volume2,
+  VolumeX,
 } from "lucide-react";
 import {
+  Children,
   type ChangeEvent,
   type CSSProperties,
+  type ReactElement,
   type FormEvent,
   type PointerEvent,
   type ReactNode,
+  useCallback,
   useEffect,
+  useId,
+  isValidElement,
   useRef,
   useState,
 } from "react";
@@ -60,6 +68,8 @@ const meshFrameMax = 500000;
 const defaultVisualOverlay: VisualOverlay = {
   asset: "waveform",
   bottomRight: "button",
+  centerLogoOnly: false,
+  centerLogoSize: "33",
   showBottomLeftSlogan: true,
   showBottomCta: false,
   showTopLogo: true,
@@ -69,13 +79,15 @@ const defaultVisualOverlay: VisualOverlay = {
 type FormatOption = (typeof formatOptions)[number];
 type SingleFormatOption = (typeof singleFormatOptions)[number];
 type ActiveTab = "generate" | "gallery";
-type VideoDuration = 15 | 30 | 60;
+type AutoRandomizeInterval = "5" | "10" | "15" | "random";
+type VideoDuration = 15 | 30 | 60 | 120 | 240;
 type VideoExportFormat = "webm" | "mp4";
 type VideoBitratePreset = "low" | "standard" | "high";
 type VideoFrameRate = 30 | 60;
 type VideoExportOptions = {
+  audioSource: VideoAudioSource;
   bitratePreset: VideoBitratePreset;
-  durationSeconds: VideoDuration;
+  durationSeconds: number;
   frameRate: VideoFrameRate;
   isLoopable: boolean;
 };
@@ -89,6 +101,7 @@ type GallerySaveStatus = "loading" | "saving" | "saved" | "error";
 type MusicStatus = "idle" | "loading" | "playing";
 type MicStatus = "idle" | "loading" | "listening";
 type VoiceStatus = "idle" | "loading" | "playing";
+type VideoAudioSource = "none" | "microphone" | "file";
 type UiTheme = "light" | "dark";
 type FrameShape = "pill" | "square" | "circle" | "dock";
 type ExportTarget = {
@@ -98,6 +111,19 @@ type ExportTarget = {
 type GalleryState = {
   items: VisualSnapshot[];
   sections: GallerySection[];
+};
+type WaveformStyle = {
+  bellBoost: number;
+  boxScale: number;
+  centerEnvelopePower: number;
+  centerGain: number;
+  edgeGain: number;
+  noiseFloor: number;
+  sideFloor: number;
+  sideMotionMix: number;
+  useStarProfile: boolean;
+  verticalGain: number;
+  widthFactor: number;
 };
 
 const galleryApiPath = "/api/gallery";
@@ -109,9 +135,7 @@ const sampleAudioPath =
 const focusedWaveformAmplitudeScale = 1;
 const exportAudioLookaheadSeconds = 0.1;
 const exportAudioBitsPerSecond = 96000;
-const exportTailSilenceSeconds = 0.7;
-const exportTailSilenceWindowSeconds = 8;
-const exportTailSilencePeakThreshold = 0.018;
+const autoRandomizeIntervals = [5, 10, 15] as const;
 
 // Running peak tracker for star-profile modes — normalizes bars so full star forms at track peak.
 let _starNormalizedPeak = 0.1;
@@ -214,6 +238,9 @@ function App() {
   const [musicStatus, setMusicStatus] = useState<MusicStatus>("idle");
   const [micStatus, setMicStatus] = useState<MicStatus>("idle");
   const [voiceStatus, setVoiceStatus] = useState<VoiceStatus>("idle");
+  const [videoAudioSource, setVideoAudioSource] =
+    useState<VideoAudioSource>("none");
+  const [audioDurationSeconds, setAudioDurationSeconds] = useState<number | null>(null);
   const [voiceNotice, setVoiceNotice] = useState("");
   const [frameShape, setFrameShape] = useState<FrameShape>("square");
   const [mesh, setMesh] = useState(() => normalizeMesh(initialMesh));
@@ -231,11 +258,19 @@ function App() {
   const [isExportingVideo, setIsExportingVideo] = useState(false);
   const [videoBitratePreset, setVideoBitratePreset] =
     useState<VideoBitratePreset>("standard");
-  const videoDuration: VideoDuration = 15;
+  const [videoDuration, setVideoDuration] = useState<VideoDuration>(15);
   const [videoExportFormat, setVideoExportFormat] =
     useState<VideoExportFormat>("mp4");
   const [videoFrameRate, setVideoFrameRate] = useState<VideoFrameRate>(30);
-  const isVideoLoopEnabled = false;
+  const [isVideoLoopEnabled, setIsVideoLoopEnabled] = useState(false);
+  const [autoRandomizeColors, setAutoRandomizeColors] = useState(false);
+  const [autoRandomizeWaveform, setAutoRandomizeWaveform] = useState(false);
+  const [colorRandomizeInterval, setColorRandomizeInterval] =
+    useState<AutoRandomizeInterval>("10");
+  const [waveformRandomizeInterval, setWaveformRandomizeInterval] =
+    useState<AutoRandomizeInterval>("10");
+  const [waveformStyle, setWaveformStyle] =
+    useState<WaveformStyle>(() => getWaveformStyle());
   const [selectedVisualId, setSelectedVisualId] = useState<string | null>(null);
   const [exportFormats, setExportFormats] = useState<Set<string>>(
     () => new Set([singleFormatOptions[0].label]),
@@ -294,6 +329,18 @@ function App() {
   const recordingProgressStyle = {
     "--recording-progress": recordingProgress.toFixed(4),
   } as CSSProperties;
+  const effectiveVideoDurationSeconds =
+    videoAudioSource === "file" && audioDurationSeconds
+      ? audioDurationSeconds
+      : videoDuration;
+  const videoAudioStatusLabel =
+    videoAudioSource === "file"
+      ? audioDurationSeconds
+        ? `Audio · ${formatMediaDurationLabel(audioDurationSeconds)}`
+        : "Audio"
+      : videoAudioSource === "microphone"
+        ? `Mic · ${formatMediaDurationLabel(videoDuration)}`
+        : "No audio";
 
   const updatePreviewZoom = (delta: number) => {
     setPreviewZoom((currentZoom) =>
@@ -401,6 +448,7 @@ function App() {
     stopVoicePlayback();
     clearAudioMeters();
     setVoiceNotice("");
+    setVideoAudioSource("none");
     setAudioSource(nextAudioUrl);
     setAudioFileName(file.name);
 
@@ -471,6 +519,8 @@ function App() {
       ...currentOverlay,
       asset: "waveform",
       bottomRight: "button",
+      centerLogoOnly: false,
+      centerLogoSize: "33",
       showBottomLeftSlogan: true,
       showBottomCta: true,
       showTopLogo: true,
@@ -494,6 +544,44 @@ function App() {
   useEffect(() => {
     writeStoredTheme(uiTheme);
   }, [uiTheme]);
+
+  useEffect(() => {
+    const audio = new Audio();
+    let isCurrentSource = true;
+
+    const updateDuration = () => {
+      if (!isCurrentSource) {
+        return;
+      }
+
+      setAudioDurationSeconds(
+        Number.isFinite(audio.duration) && audio.duration > 0 ? audio.duration : null,
+      );
+    };
+    const clearDuration = () => {
+      if (isCurrentSource) {
+        setAudioDurationSeconds(null);
+      }
+    };
+
+    setAudioDurationSeconds(null);
+    setAudioElementSource(audio, audioSource);
+    audio.preload = "metadata";
+    audio.addEventListener("loadedmetadata", updateDuration);
+    audio.addEventListener("durationchange", updateDuration);
+    audio.addEventListener("error", clearDuration);
+    audio.load();
+
+    return () => {
+      isCurrentSource = false;
+      audio.removeEventListener("loadedmetadata", updateDuration);
+      audio.removeEventListener("durationchange", updateDuration);
+      audio.removeEventListener("error", clearDuration);
+      audio.pause();
+      audio.removeAttribute("src");
+      audio.load();
+    };
+  }, [audioSource]);
 
   useEffect(() => {
     let isMounted = true;
@@ -635,7 +723,7 @@ function App() {
     }));
   };
 
-  const randomizeComposition = () => {
+  const randomizeComposition = useCallback(() => {
     const nextFrame = randomBetween(0, meshFrameMax);
     setTimelineFrame(nextFrame);
     setPausedFrame(nextFrame);
@@ -657,9 +745,9 @@ function App() {
         name: blob.name,
       })),
     );
-  };
+  }, []);
 
-  const randomizeColors = () => {
+  const randomizeColors = useCallback(() => {
     setBackgroundColor(randomPaletteColor(activePaletteId));
     setBlobs((currentBlobs) =>
       currentBlobs.map((blob) => ({
@@ -667,7 +755,72 @@ function App() {
         color: randomPaletteColor(activePaletteId),
       })),
     );
-  };
+  }, [activePaletteId]);
+
+  const randomizeWaveform = useCallback(() => {
+    setWaveformStyle(createRandomWaveformStyle());
+    setMesh((currentMesh) => ({
+      ...currentMesh,
+      audioReactivity: randomBetween(14, 48),
+      audioSmoothness: randomBetween(0.4, 5),
+      distortion: randomBetween(0.12, 1.15),
+      grainMixer: grainMixerRef.current,
+      grainOverlay: fixedGrainOverlay,
+      motionBlur: randomBetween(0, 0.7),
+      scale: randomBetween(0.7, 2.4),
+      swirl: randomBetween(0, 0.6),
+    }));
+  }, []);
+
+  useEffect(() => {
+    if (!autoRandomizeColors || isExportingVideo) {
+      return;
+    }
+
+    let timeoutId = 0;
+    const scheduleNextRandomize = () => {
+      timeoutId = window.setTimeout(() => {
+        randomizeColors();
+        scheduleNextRandomize();
+      }, getAutoRandomizeDelayMs(colorRandomizeInterval));
+    };
+
+    scheduleNextRandomize();
+
+    return () => {
+      window.clearTimeout(timeoutId);
+    };
+  }, [
+    autoRandomizeColors,
+    colorRandomizeInterval,
+    isExportingVideo,
+    randomizeColors,
+  ]);
+
+  useEffect(() => {
+    if (!autoRandomizeWaveform || isExportingVideo) {
+      return;
+    }
+
+    let timeoutId = 0;
+    const scheduleNextRandomize = () => {
+      timeoutId = window.setTimeout(() => {
+        randomizeWaveform();
+        scheduleNextRandomize();
+      }, getAutoRandomizeDelayMs(waveformRandomizeInterval));
+    };
+
+    scheduleNextRandomize();
+
+    return () => {
+      window.clearTimeout(timeoutId);
+    };
+  }, [
+    autoRandomizeWaveform,
+    isExportingVideo,
+    randomizeWaveform,
+    waveformRandomizeInterval,
+  ]);
 
   const togglePlayback = () => {
     const currentMesh = normalizeMesh(stageRef.current?.getCurrentMesh() ?? mesh);
@@ -759,12 +912,28 @@ function App() {
     }
 
     const baseName = slugify(generateVisualName());
+    const exportOverlay = getRenderableOverlay(visualOverlay);
+    await waitForFontsReady();
+    const overlayImage = await loadOverlayImage(exportOverlay);
+    const qrImage = exportOverlay.showBottomCta && exportOverlay.bottomRight === "qr"
+      ? await loadQrCodeImage(exportOverlay.tone)
+      : null;
+    const topLogoImage = exportOverlay.showTopLogo
+      ? await loadTopLogoImage(exportOverlay)
+      : null;
 
     for (const target of targets) {
       const dataUrl = await captureTargetPng(
         target.handle,
         scale,
         target.format,
+        exportOverlay,
+        audioSpectrum,
+        audioLevel,
+        overlayImage,
+        qrImage,
+        topLogoImage,
+        waveformStyle,
       );
 
       if (!dataUrl) {
@@ -794,11 +963,19 @@ function App() {
     }
 
     const baseName = slugify(generateVisualName());
+    const exportAudioSource = videoAudioSource;
+    const exportDurationSeconds = effectiveVideoDurationSeconds;
+
+    if (exportAudioSource === "file") {
+      stopVoicePlayback(true);
+      clearAudioMeters();
+    }
 
     exportCancelRef.current = false;
     setIsExportingVideo(true);
     setVideoExportProgress(null);
     await waitForNextAnimationFrame();
+    const completedExports: Array<{ blob: Blob; filename: string }> = [];
 
     try {
       for (const [formatIndex, target] of targets.entries()) {
@@ -812,9 +989,10 @@ function App() {
           progress: 0,
           totalFormats: targets.length,
         });
-        await exportVideoTarget(target, baseName, videoFormat, mimeType, {
+        const completedExport = await exportVideoTarget(target, baseName, videoFormat, mimeType, {
+          audioSource: exportAudioSource,
           bitratePreset: videoBitratePreset,
-          durationSeconds: videoDuration,
+          durationSeconds: exportDurationSeconds,
           frameRate: videoFrameRate,
           isLoopable: isVideoLoopEnabled,
         }, (progress) => {
@@ -825,6 +1003,20 @@ function App() {
             totalFormats: targets.length,
           });
         });
+
+        if (completedExport) {
+          completedExports.push(completedExport);
+        }
+      }
+
+      if (!exportCancelRef.current && completedExports.length > 0) {
+        if (completedExports.length === 1) {
+          const [{ blob, filename }] = completedExports;
+          downloadBlob(blob, filename);
+        } else {
+          const archive = await createZipBlob(completedExports);
+          downloadBlob(archive, `${baseName}-${videoFormat}-formats.zip`);
+        }
       }
     } catch {
       if (!exportCancelRef.current) {
@@ -853,10 +1045,7 @@ function App() {
       throw new Error("Video export is not supported in this browser.");
     }
 
-    const recordingOverlay: VisualOverlay = {
-      ...visualOverlay,
-      asset: "waveform",
-    };
+    const recordingOverlay = getRenderableOverlay(visualOverlay);
     await waitForFontsReady();
     const overlayImage = await loadOverlayImage(recordingOverlay);
     const qrImage = recordingOverlay.showBottomCta && recordingOverlay.bottomRight === "qr"
@@ -873,59 +1062,95 @@ function App() {
       throw new Error("Video export is not supported in this browser.");
     }
 
-    const exportAudio = new Audio();
-    activeExportAudioRef.current = exportAudio;
-    setAudioElementSource(exportAudio, audioSource);
-    exportAudio.preload = "auto";
-    exportAudio.currentTime = 0;
+    let exportAudio: HTMLAudioElement | null = null;
+    let exportAudioContext: AudioContext | null = null;
+    let exportAnalyser: AnalyserNode | null = null;
+    let exportAudioTracks: MediaStreamTrack[] = [];
+    let exportAudioDelayMs = 0;
+    let resolvedDurationSeconds = options.durationSeconds;
 
-    await new Promise<void>((resolve) => {
-      const onReady = () => {
-        exportAudio.removeEventListener("loadedmetadata", onReady);
-        resolve();
-      };
-      if (Number.isFinite(exportAudio.duration) && exportAudio.duration > 0) {
-        resolve();
-      } else {
-        exportAudio.addEventListener("loadedmetadata", onReady);
-        exportAudio.load();
+    if (options.audioSource === "file") {
+      const selectedAudio = new Audio();
+      exportAudio = selectedAudio;
+      activeExportAudioRef.current = selectedAudio;
+      setAudioElementSource(selectedAudio, audioSource);
+      selectedAudio.preload = "auto";
+      selectedAudio.currentTime = 0;
+
+      await new Promise<void>((resolve) => {
+        const finishLoading = () => {
+          selectedAudio.removeEventListener("loadedmetadata", onReady);
+          selectedAudio.removeEventListener("error", finishLoading);
+          resolve();
+        };
+        const onReady = () => finishLoading();
+        if (Number.isFinite(selectedAudio.duration) && selectedAudio.duration > 0) {
+          resolve();
+        } else {
+          selectedAudio.addEventListener("loadedmetadata", onReady);
+          selectedAudio.addEventListener("error", finishLoading);
+          selectedAudio.load();
+        }
+      });
+
+      if (Number.isFinite(selectedAudio.duration) && selectedAudio.duration > 0) {
+        resolvedDurationSeconds = selectedAudio.duration;
       }
-    });
 
-    const durationMs = Math.max(
-      1000,
-      Math.round((Number.isFinite(exportAudio.duration) ? exportAudio.duration : options.durationSeconds) * 1000),
-    );
+      if (exportCancelRef.current) {
+        selectedAudio.pause();
+        if (activeExportAudioRef.current === selectedAudio) {
+          activeExportAudioRef.current = null;
+        }
+        return;
+      }
+
+      exportAudioContext = new AudioContext();
+      exportAnalyser = exportAudioContext.createAnalyser();
+      exportAnalyser.fftSize = 256;
+      exportAnalyser.smoothingTimeConstant = 0.48;
+      const exportSource = exportAudioContext.createMediaElementSource(selectedAudio);
+      const exportAudioDelay = exportAudioContext.createDelay(
+        exportAudioLookaheadSeconds + 0.05,
+      );
+      const monoDestination = exportAudioContext.createMediaStreamDestination();
+      const monoSplitter = exportAudioContext.createChannelSplitter(2);
+      const monoLeftGain = exportAudioContext.createGain();
+      const monoRightGain = exportAudioContext.createGain();
+      const monoMerger = exportAudioContext.createChannelMerger(1);
+      exportAudioDelay.delayTime.value = exportAudioLookaheadSeconds;
+      monoDestination.channelCount = 1;
+      monoDestination.channelCountMode = "explicit";
+      monoLeftGain.gain.value = 0.5;
+      monoRightGain.gain.value = 0.5;
+      exportSource.connect(exportAnalyser);
+      exportSource.connect(exportAudioDelay);
+      exportAudioDelay.connect(monoSplitter);
+      monoSplitter.connect(monoLeftGain, 0);
+      monoSplitter.connect(monoRightGain, 1);
+      monoLeftGain.connect(monoMerger, 0, 0);
+      monoRightGain.connect(monoMerger, 0, 0);
+      monoMerger.connect(monoDestination);
+      exportAudioTracks = monoDestination.stream.getAudioTracks();
+      exportAudioDelayMs = Math.round(exportAudioLookaheadSeconds * 1000);
+    } else if (options.audioSource === "microphone") {
+      const microphoneTrack = micStreamRef.current
+        ?.getAudioTracks()
+        .find((track) => track.readyState === "live");
+
+      if (microphoneTrack) {
+        exportAudioTracks = [microphoneTrack.clone()];
+        exportAnalyser = micAnalyserRef.current;
+      }
+    }
+
+    const durationMs = Math.max(1000, Math.round(resolvedDurationSeconds * 1000));
 
     if (exportCancelRef.current) {
       return;
     }
 
-    const exportAudioContext = new AudioContext();
-    const exportAnalyser = exportAudioContext.createAnalyser();
-    exportAnalyser.fftSize = 256;
-    exportAnalyser.smoothingTimeConstant = 0.48;
-    const exportSource = exportAudioContext.createMediaElementSource(exportAudio);
-    const exportAudioDelay = exportAudioContext.createDelay(exportAudioLookaheadSeconds + 0.05);
-    const monoDestination = exportAudioContext.createMediaStreamDestination();
-    const monoSplitter = exportAudioContext.createChannelSplitter(2);
-    const monoLeftGain = exportAudioContext.createGain();
-    const monoRightGain = exportAudioContext.createGain();
-    const monoMerger = exportAudioContext.createChannelMerger(1);
-    exportAudioDelay.delayTime.value = exportAudioLookaheadSeconds;
-    monoDestination.channelCount = 1;
-    monoDestination.channelCountMode = "explicit";
-    monoLeftGain.gain.value = 0.5;
-    monoRightGain.gain.value = 0.5;
-    exportSource.connect(exportAnalyser);
-    exportSource.connect(exportAudioDelay);
-    exportAudioDelay.connect(monoSplitter);
-    monoSplitter.connect(monoLeftGain, 0);
-    monoSplitter.connect(monoRightGain, 1);
-    monoLeftGain.connect(monoMerger, 0, 0);
-    monoRightGain.connect(monoMerger, 0, 0);
-    monoMerger.connect(monoDestination);
-    const exportLevels = new Uint8Array(exportAnalyser.frequencyBinCount);
+    const exportLevels = new Uint8Array(exportAnalyser?.frequencyBinCount ?? 128);
     let exportMeshSpectrum = Array(64).fill(0);
     let exportWaveformSpectrum = Array(64).fill(0);
     let exportBands = Array(8).fill(0);
@@ -937,13 +1162,9 @@ function App() {
     let drawFrameId = 0;
     let stopTimeoutId = 0;
     let fallbackStopTimeoutId = 0;
-    let silentTailStartedAt: number | null = null;
-    let hasHeardAudio = false;
     let hasRequestedRecorderStop = false;
     let hasScheduledRecorderStop = false;
-    let onExportAudioEnded: (() => void) | null = null;
     let recorder: MediaRecorder;
-    const exportAudioDelayMs = Math.round(exportAudioLookaheadSeconds * 1000);
     const stopRecorder = () => {
       hasRequestedRecorderStop = true;
       if (recorder.state !== "inactive") {
@@ -963,43 +1184,18 @@ function App() {
       context: CanvasRenderingContext2D,
       deltaMs = 0,
     ) => {
-      exportAnalyser.getByteFrequencyData(exportLevels);
-      const nextSpectrum = sampleSpectrumLevels(
-        exportLevels,
-        exportAnalyser.context.sampleRate,
-        64,
-        1000,
-        16000,
-      );
-      const rawSpectrumPeak = nextSpectrum.reduce(
-        (peak, value) => Math.max(peak, value),
-        0,
-      );
-      const remainingAudioSeconds =
-        Number.isFinite(exportAudio.duration) && exportAudio.duration > 0
-          ? Math.max(0, exportAudio.duration - exportAudio.currentTime)
-          : Infinity;
+      let nextSpectrum = Array(64).fill(0);
 
-      if (rawSpectrumPeak >= exportTailSilencePeakThreshold) {
-        hasHeardAudio = true;
-        silentTailStartedAt = null;
-      } else if (
-        startedAt > 0 &&
-        hasHeardAudio &&
-        remainingAudioSeconds <= exportTailSilenceWindowSeconds
-      ) {
-        silentTailStartedAt ??= performance.now();
-
-        if (
-          performance.now() - silentTailStartedAt >=
-          exportTailSilenceSeconds * 1000
-        ) {
-          scheduleStopRecorder(exportAudioDelayMs);
-        }
-      } else {
-        silentTailStartedAt = null;
+      if (exportAnalyser) {
+        exportAnalyser.getByteFrequencyData(exportLevels);
+        nextSpectrum = sampleSpectrumLevels(
+          exportLevels,
+          exportAnalyser.context.sampleRate,
+          64,
+          1000,
+          16000,
+        );
       }
-
       exportMeshSpectrum = exportMeshSpectrum.map((currentBand, index) =>
         currentBand * 0.68 + (nextSpectrum[index] ?? 0) * 0.32,
       );
@@ -1029,6 +1225,7 @@ function App() {
         exportWaveformSpectrum,
         recordingOverlay,
         topLogoImage,
+        waveformStyle,
       );
 
       if (!drewVisibleOverlay) {
@@ -1039,6 +1236,7 @@ function App() {
           qrImage,
           topLogoImage,
           overlay: recordingOverlay,
+          waveformStyle,
         });
       }
     };
@@ -1064,11 +1262,7 @@ function App() {
       lastDrawAt = now;
       const nextProgress = Math.max(0, Math.min(1, elapsedMs / durationMs));
 
-      if (
-        Number.isFinite(exportAudio.duration) &&
-        exportAudio.duration > 0 &&
-        exportAudio.currentTime >= exportAudio.duration - 0.03
-      ) {
+      if (elapsedMs >= durationMs) {
         scheduleStopRecorder(exportAudioDelayMs);
       }
 
@@ -1098,7 +1292,7 @@ function App() {
 
     const videoStream = captureCanvas.captureStream(options.frameRate);
     const mixStream = new MediaStream(videoStream.getVideoTracks());
-    monoDestination.stream.getAudioTracks().forEach((track: MediaStreamTrack) => {
+    exportAudioTracks.forEach((track) => {
       mixStream.addTrack(track);
     });
     const chunks: BlobPart[] = [];
@@ -1106,7 +1300,9 @@ function App() {
     try {
       recorder = new MediaRecorder(mixStream, {
         ...(mimeType ? { mimeType } : {}),
-        audioBitsPerSecond: exportAudioBitsPerSecond,
+        ...(exportAudioTracks.length > 0
+          ? { audioBitsPerSecond: exportAudioBitsPerSecond }
+          : {}),
         videoBitsPerSecond: getCompressedVideoBitrate(target.format, options.bitratePreset),
       });
       activeExportRecorderRef.current = recorder;
@@ -1141,42 +1337,43 @@ function App() {
         lastDrawAt = startedAt;
         onProgress(0);
         drawFrame();
-        onExportAudioEnded = () => {
-          scheduleStopRecorder(exportAudioDelayMs);
-        };
-        exportAudio.addEventListener("ended", onExportAudioEnded, { once: true });
-        void exportAudioContext.resume().catch(() => {});
-        void exportAudio.play().catch(() => {
-          scheduleStopRecorder(0);
-        });
+        if (exportAudioContext && exportAudio) {
+          void exportAudioContext.resume().catch(() => {});
+          void exportAudio.play().catch(() => {
+            // Keep recording even if the selected audio file cannot start.
+          });
+        }
         fallbackStopTimeoutId = window.setTimeout(
           () => scheduleStopRecorder(0),
           durationMs + exportAudioDelayMs + 250,
         );
       });
 
-      if (!exportCancelRef.current) {
-        downloadBlob(
-          blob,
-          `${baseName}-${formatSlug(target.format)}-${Math.max(1, Math.round(durationMs / 1000))}s${
-            options.isLoopable ? "-loop" : ""
-          }.${videoFormat}`,
-        );
+      if (exportCancelRef.current) {
+        return null;
       }
+
+      return {
+        blob,
+        filename: `${baseName}-${formatSlug(target.format)}-${Math.max(1, Math.round(durationMs / 1000))}s${
+          options.isLoopable ? "-loop" : ""
+        }.${videoFormat}`,
+      };
     } finally {
-      if (onExportAudioEnded) {
-        exportAudio.removeEventListener("ended", onExportAudioEnded);
-      }
       window.clearTimeout(stopTimeoutId);
       window.clearTimeout(fallbackStopTimeoutId);
       window.cancelAnimationFrame(drawFrameId);
-      exportAudio.pause();
-      exportAudio.currentTime = 0;
+      exportAudio?.pause();
+      if (exportAudio) {
+        exportAudio.currentTime = 0;
+      }
       clearAudioMeters();
-      void exportAudioContext.close();
+      if (exportAudioContext) {
+        void exportAudioContext.close();
+      }
       videoStream.getTracks().forEach((track) => track.stop());
       mixStream.getTracks().forEach((track) => track.stop());
-      if (activeExportAudioRef.current === exportAudio) {
+      if (exportAudio && activeExportAudioRef.current === exportAudio) {
         activeExportAudioRef.current = null;
       }
       if (activeExportRecorderRef.current === recorder) {
@@ -1334,7 +1531,7 @@ function App() {
     setMusicStatus("idle");
   };
 
-  const stopMicrophone = () => {
+  const stopMicrophone = (preserveVideoAudioSource = false) => {
     window.cancelAnimationFrame(micFrameRef.current);
     micStreamRef.current?.getTracks().forEach((track) => track.stop());
     micSourceRef.current?.disconnect();
@@ -1345,12 +1542,22 @@ function App() {
     micAnalyserRef.current = null;
     micAudioContextRef.current = null;
     setMicStatus("idle");
+    if (!preserveVideoAudioSource) {
+      setVideoAudioSource((currentSource) =>
+        currentSource === "microphone" ? "none" : currentSource,
+      );
+    }
   };
 
-  const stopVoicePlayback = () => {
+  const stopVoicePlayback = (preserveVideoAudioSource = false) => {
     voiceAudioRef.current?.pause();
     window.cancelAnimationFrame(voiceFrameRef.current);
     setVoiceStatus("idle");
+    if (!preserveVideoAudioSource) {
+      setVideoAudioSource((currentSource) =>
+        currentSource === "file" ? "none" : currentSource,
+      );
+    }
   };
 
   const toggleMusic = async () => {
@@ -1406,7 +1613,7 @@ function App() {
   };
 
   const toggleMicrophone = async () => {
-    if (micStatus === "listening") {
+    if (videoAudioSource === "microphone" || micStatus === "listening") {
       stopMicrophone();
       setAudioBands(Array(8).fill(0));
       setAudioSpectrum(Array(64).fill(0));
@@ -1457,6 +1664,7 @@ function App() {
         await audioContext.resume();
       }
 
+      setVideoAudioSource("microphone");
       setMicStatus("listening");
       updateMicLevel();
     } catch (error) {
@@ -1473,7 +1681,7 @@ function App() {
   };
 
   const playVoiceLine = async () => {
-    if (voiceStatus !== "idle") {
+    if (videoAudioSource === "file" || voiceStatus !== "idle") {
       stopVoicePlayback();
       setAudioBands(Array(8).fill(0));
       setAudioSpectrum(Array(64).fill(0));
@@ -1525,6 +1733,7 @@ function App() {
       audio.onerror = () => {
         window.cancelAnimationFrame(voiceFrameRef.current);
         setVoiceStatus("idle");
+        setVideoAudioSource("none");
         setAudioBands(Array(8).fill(0));
         setAudioSpectrum(Array(64).fill(0));
         setAudioLevel(0);
@@ -1532,10 +1741,12 @@ function App() {
       };
 
       await audio.play();
+      setVideoAudioSource("file");
       setVoiceStatus("playing");
       updateVoiceLevel();
     } catch (error) {
       setVoiceStatus("idle");
+      setVideoAudioSource("none");
       setAudioBands(Array(8).fill(0));
       setAudioSpectrum(Array(64).fill(0));
       setAudioLevel(0);
@@ -1621,25 +1832,43 @@ function App() {
                 </Button>
                 <div className="grid grid-cols-[minmax(0,1fr)_auto] gap-2">
                   <Button
-                    className="w-full"
+                    className="h-auto min-h-10 w-full justify-between whitespace-normal px-3 py-2 text-left"
                     disabled={isExportingVideo || exportFormats.size === 0}
                     type="button"
                     variant="secondary"
                     onClick={() => exportVideo(videoExportFormat)}
                   >
-                    {isExportingVideo
-                      ? "Recording..."
-                      : exportFormats.size > 1
-                        ? `Export Video (${exportFormats.size} formats)`
-                        : "Export Video"}
+                    <span>
+                      {isExportingVideo
+                        ? "Recording..."
+                        : exportFormats.size > 1
+                          ? `Export Video (${exportFormats.size} formats)`
+                          : "Export Video"}
+                    </span>
+                    <span className="flex shrink-0 items-center gap-1 text-xs font-bold opacity-70">
+                      {videoAudioSource === "file" ? (
+                        <Volume2 className="size-3.5" aria-hidden="true" />
+                      ) : videoAudioSource === "microphone" ? (
+                        <Mic className="size-3.5" aria-hidden="true" />
+                      ) : (
+                        <VolumeX className="size-3.5" aria-hidden="true" />
+                      )}
+                      {videoAudioStatusLabel}
+                    </span>
                   </Button>
                   <ExportVideoSettings
+                    audioDurationSeconds={audioDurationSeconds}
+                    audioSource={videoAudioSource}
                     bitratePreset={videoBitratePreset}
                     disabled={isExportingVideo}
+                    durationSeconds={videoDuration}
                     frameRate={videoFrameRate}
+                    isLoopEnabled={isVideoLoopEnabled}
                     videoFormat={videoExportFormat}
                     onBitratePresetChange={setVideoBitratePreset}
+                    onDurationChange={setVideoDuration}
                     onFrameRateChange={setVideoFrameRate}
+                    onLoopEnabledChange={setIsVideoLoopEnabled}
                     onVideoFormatChange={setVideoExportFormat}
                   />
                 </div>
@@ -1735,7 +1964,7 @@ function App() {
               </Button>
               <Button
                 aria-label={musicStatus === "playing" ? "Pause sample audio" : "Play sample audio"}
-                disabled={musicStatus === "loading"}
+                disabled={isExportingVideo || musicStatus === "loading"}
                 size="icon"
                 type="button"
                 variant={musicStatus === "playing" ? "secondary" : "outline"}
@@ -1744,21 +1973,23 @@ function App() {
                 <AudioLines className="size-4" aria-hidden="true" />
               </Button>
               <Button
-                aria-label={micStatus === "listening" ? "Stop microphone input" : "Start microphone input"}
-                disabled={micStatus === "loading"}
+                aria-label={videoAudioSource === "microphone" ? "Disable microphone audio" : "Enable microphone audio"}
+                aria-pressed={videoAudioSource === "microphone"}
+                disabled={isExportingVideo || micStatus === "loading"}
                 size="icon"
                 type="button"
-                variant={micStatus === "listening" ? "secondary" : "outline"}
+                variant={videoAudioSource === "microphone" ? "default" : "outline"}
                 onClick={toggleMicrophone}
               >
                 <Mic className="size-4" aria-hidden="true" />
               </Button>
               <Button
-                aria-label={voiceStatus === "playing" ? "Pause MP3 audio" : "Play MP3 audio"}
-                disabled={voiceStatus === "loading"}
+                aria-label={videoAudioSource === "file" ? "Disable file audio" : "Enable file audio"}
+                aria-pressed={videoAudioSource === "file"}
+                disabled={isExportingVideo || voiceStatus === "loading"}
                 size="icon"
                 type="button"
-                variant={voiceStatus === "playing" ? "secondary" : "outline"}
+                variant={videoAudioSource === "file" ? "default" : "outline"}
                 onClick={playVoiceLine}
               >
                 <Volume2 className="size-4" aria-hidden="true" />
@@ -1769,6 +2000,18 @@ function App() {
                 {voiceNotice}
               </p>
             ) : null}
+
+            <AutoRandomizeSettings
+              colorInterval={colorRandomizeInterval}
+              colorsEnabled={autoRandomizeColors}
+              disabled={isExportingVideo}
+              waveformEnabled={autoRandomizeWaveform}
+              waveformInterval={waveformRandomizeInterval}
+              onColorIntervalChange={setColorRandomizeInterval}
+              onColorsEnabledChange={setAutoRandomizeColors}
+              onWaveformEnabledChange={setAutoRandomizeWaveform}
+              onWaveformIntervalChange={setWaveformRandomizeInterval}
+            />
 
             <OverlaySettings
               overlay={visualOverlay}
@@ -2017,6 +2260,7 @@ function App() {
                       audioLevel={audioLevel}
                       frameShape={frameShape}
                       overlay={visualOverlay}
+                      waveformStyle={waveformStyle}
                     />
                     <SceneDecorations overlay={visualOverlay} />
                   </div>
@@ -2158,22 +2402,50 @@ function formatTimelineFrame(value: number) {
   return Math.round(value).toLocaleString("en-US");
 }
 
+function formatVideoDurationLabel(duration: VideoDuration) {
+  if (duration <= 60) {
+    return `${duration} seconds`;
+  }
+
+  return `${duration / 60} minutes`;
+}
+
+function formatMediaDurationLabel(durationSeconds: number) {
+  const totalSeconds = Math.max(0, Math.round(durationSeconds));
+  const minutes = Math.floor(totalSeconds / 60);
+  const seconds = totalSeconds % 60;
+
+  return `${minutes}:${seconds.toString().padStart(2, "0")}`;
+}
+
 type ExportVideoSettingsProps = {
+  audioDurationSeconds: number | null;
+  audioSource: VideoAudioSource;
   bitratePreset: VideoBitratePreset;
   disabled: boolean;
+  durationSeconds: VideoDuration;
   frameRate: VideoFrameRate;
+  isLoopEnabled: boolean;
   onBitratePresetChange: (preset: VideoBitratePreset) => void;
+  onDurationChange: (duration: VideoDuration) => void;
   onFrameRateChange: (frameRate: VideoFrameRate) => void;
+  onLoopEnabledChange: (enabled: boolean) => void;
   onVideoFormatChange: (format: VideoExportFormat) => void;
   videoFormat: VideoExportFormat;
 };
 
 function ExportVideoSettings({
+  audioDurationSeconds,
+  audioSource,
   bitratePreset,
   disabled,
+  durationSeconds,
   frameRate,
+  isLoopEnabled,
   onBitratePresetChange,
+  onDurationChange,
   onFrameRateChange,
+  onLoopEnabledChange,
   onVideoFormatChange,
   videoFormat,
 }: ExportVideoSettingsProps) {
@@ -2237,6 +2509,36 @@ function ExportVideoSettings({
           ))}
           <div className="my-1 h-px bg-[var(--border)]" role="separator" />
           <div className="px-3 py-1.5 text-xs font-bold uppercase text-[var(--muted-foreground)]">
+            Duration
+          </div>
+          {audioSource === "file" ? (
+            <div className="grid min-h-9 w-full grid-cols-[1rem_minmax(0,1fr)] items-center gap-3 px-3 text-sm font-semibold">
+              <span className="flex size-4 items-center justify-center">
+                <Check className="size-4" aria-hidden="true" />
+              </span>
+              <span>
+                {audioDurationSeconds
+                  ? `Audio duration · ${formatMediaDurationLabel(audioDurationSeconds)}`
+                  : "Audio duration"}
+              </span>
+            </div>
+          ) : (
+            ([15, 30, 60, 120, 240] as const).map((durationOption) => (
+              <MenuCheckItem
+                isSelected={durationSeconds === durationOption}
+                key={durationOption}
+                label={formatVideoDurationLabel(durationOption)}
+                onClick={() => onDurationChange(durationOption)}
+              />
+            ))
+          )}
+          <MenuCheckItem
+            isSelected={isLoopEnabled}
+            label="Loop Video"
+            onClick={() => onLoopEnabledChange(!isLoopEnabled)}
+          />
+          <div className="my-1 h-px bg-[var(--border)]" role="separator" />
+          <div className="px-3 py-1.5 text-xs font-bold uppercase text-[var(--muted-foreground)]">
             FPS
           </div>
           {([30, 60] as const).map((frameRateOption) => (
@@ -2279,13 +2581,15 @@ function MenuCheckItem({ isSelected, label, onClick }: MenuCheckItemProps) {
   return (
     <button
       aria-checked={isSelected}
-      className="flex min-h-9 w-full items-center justify-between gap-3 rounded px-3 text-left text-sm font-semibold transition hover:bg-[var(--accent)] focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-[var(--ring)]"
+      className="grid min-h-9 w-full grid-cols-[1rem_minmax(0,1fr)] items-center gap-3 rounded px-3 text-left text-sm font-semibold transition hover:bg-[var(--accent)] focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-[var(--ring)]"
       onClick={onClick}
       role="menuitemcheckbox"
       type="button"
     >
+      <span className="flex size-4 items-center justify-center">
+        {isSelected ? <Check className="size-4" aria-hidden="true" /> : null}
+      </span>
       <span>{label}</span>
-      {isSelected ? <Check className="size-4" aria-hidden="true" /> : null}
     </button>
   );
 }
@@ -2336,6 +2640,122 @@ function spectrumToLevel(spectrum: number[]) {
   );
 }
 
+type AutoRandomizeSettingsProps = {
+  colorInterval: AutoRandomizeInterval;
+  colorsEnabled: boolean;
+  disabled: boolean;
+  onColorIntervalChange: (interval: AutoRandomizeInterval) => void;
+  onColorsEnabledChange: (enabled: boolean) => void;
+  onWaveformEnabledChange: (enabled: boolean) => void;
+  onWaveformIntervalChange: (interval: AutoRandomizeInterval) => void;
+  waveformEnabled: boolean;
+  waveformInterval: AutoRandomizeInterval;
+};
+
+function AutoRandomizeSettings({
+  colorInterval,
+  colorsEnabled,
+  disabled,
+  onColorIntervalChange,
+  onColorsEnabledChange,
+  onWaveformEnabledChange,
+  onWaveformIntervalChange,
+  waveformEnabled,
+  waveformInterval,
+}: AutoRandomizeSettingsProps) {
+  return (
+    <section className="grid gap-3 border-t border-[var(--border)] pt-5">
+      <h2 className="text-base font-bold text-[var(--foreground)]">
+        Auto Randomize
+      </h2>
+      <div className="grid gap-3 rounded-md border border-[var(--border)] bg-[var(--background)]/30 p-3">
+        <SwitchField
+          checked={colorsEnabled}
+          disabled={disabled}
+          label="Randomize Colors"
+          onChange={onColorsEnabledChange}
+        />
+        <SelectField
+          disabled={disabled}
+          label="Colors every"
+          value={colorInterval}
+          onChange={(value) => onColorIntervalChange(value as AutoRandomizeInterval)}
+        >
+          {autoRandomizeIntervalOptions().map((option) => (
+            <option key={option.value} value={option.value}>
+              {option.label}
+            </option>
+          ))}
+        </SelectField>
+      </div>
+      <div className="grid gap-3 rounded-md border border-[var(--border)] bg-[var(--background)]/30 p-3">
+        <SwitchField
+          checked={waveformEnabled}
+          disabled={disabled}
+          label="Randomize Waveform"
+          onChange={onWaveformEnabledChange}
+        />
+        <SelectField
+          disabled={disabled}
+          label="Waveform every"
+          value={waveformInterval}
+          onChange={(value) => onWaveformIntervalChange(value as AutoRandomizeInterval)}
+        >
+          {autoRandomizeIntervalOptions().map((option) => (
+            <option key={option.value} value={option.value}>
+              {option.label}
+            </option>
+          ))}
+        </SelectField>
+      </div>
+    </section>
+  );
+}
+
+type SwitchFieldProps = {
+  checked: boolean;
+  disabled?: boolean;
+  label: string;
+  onChange: (checked: boolean) => void;
+};
+
+function SwitchField({
+  checked,
+  disabled = false,
+  label,
+  onChange,
+}: SwitchFieldProps) {
+  return (
+    <button
+      aria-checked={checked}
+      disabled={disabled}
+      role="switch"
+      type="button"
+      className={cn(
+        "flex min-h-10 items-center justify-between gap-3 rounded-md text-left text-sm font-semibold text-[var(--foreground)] transition focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-[var(--ring)] disabled:cursor-not-allowed",
+        disabled && "opacity-55",
+      )}
+      onClick={() => onChange(!checked)}
+    >
+      <span>{label}</span>
+      <span
+        className={cn(
+          "flex h-6 w-11 items-center rounded-full border border-[var(--border)] p-0.5 transition",
+          checked ? "bg-[var(--primary)]" : "bg-[var(--muted)]",
+        )}
+        aria-hidden="true"
+      >
+        <span
+          className={cn(
+            "block size-4 rounded-full bg-[var(--background)] shadow-sm transition-transform",
+          )}
+          style={{ transform: checked ? "translateX(18px)" : "translateX(0)" }}
+        />
+      </span>
+    </button>
+  );
+}
+
 type OverlayControlProps = {
   onChange: (overlay: VisualOverlay) => void;
   overlay: VisualOverlay;
@@ -2345,41 +2765,70 @@ function OverlaySettings({ onChange, overlay }: OverlayControlProps) {
   const updateOverlay = (nextOverlay: Partial<VisualOverlay>) => {
     onChange({ ...overlay, ...nextOverlay });
   };
+  const isCenterLogoOnly = overlay.centerLogoOnly;
 
   return (
     <section className="grid gap-3 border-t border-[var(--border)] pt-5">
       <h2 className="text-base font-bold text-[var(--foreground)]">Overlay</h2>
       <SelectField
-        label="Right bottom"
-        value={overlay.bottomRight}
-        onChange={(value) =>
-          updateOverlay({ bottomRight: value as BottomRightOverlay, showBottomCta: true })
-        }
-      >
-        <option value="button">Book a Demo</option>
-        <option value="qr">QR Code</option>
-        <option value="slogan">Slogan right</option>
-      </SelectField>
-      <SelectField
-        label="Left bottom slogan"
-        value={overlay.showBottomLeftSlogan ? "show" : "hide"}
+        label="Center visual"
+        value={isCenterLogoOnly ? "logo-only" : "waveform"}
         onChange={(value) =>
           updateOverlay({
-            showBottomLeftSlogan: value === "show",
+            asset: value === "logo-only" ? "logo" : "waveform",
+            centerLogoOnly: value === "logo-only",
           })
         }
       >
-        <option value="show">Show</option>
-        <option value="hide">Hide</option>
+        <option value="waveform">Waveform</option>
+        <option value="logo-only">Large logo only</option>
       </SelectField>
-      <SelectField
-        label="Top left logo"
-        value={overlay.showTopLogo ? "show" : "hide"}
-        onChange={(value) => updateOverlay({ showTopLogo: value === "show" })}
-      >
-        <option value="show">Show</option>
-        <option value="hide">Hide</option>
-      </SelectField>
+      {isCenterLogoOnly ? (
+        <SelectField
+          label="Logo size"
+          value={overlay.centerLogoSize}
+          onChange={(value) =>
+            updateOverlay({ centerLogoSize: value as CenterLogoSize })
+          }
+        >
+          <option value="33">33%</option>
+          <option value="50">50%</option>
+        </SelectField>
+      ) : (
+        <>
+          <SelectField
+            label="Right bottom"
+            value={overlay.bottomRight}
+            onChange={(value) =>
+              updateOverlay({ bottomRight: value as BottomRightOverlay, showBottomCta: true })
+            }
+          >
+            <option value="button">Book a Demo</option>
+            <option value="qr">QR Code</option>
+            <option value="slogan">Slogan right</option>
+          </SelectField>
+          <SelectField
+            label="Left bottom slogan"
+            value={overlay.showBottomLeftSlogan ? "show" : "hide"}
+            onChange={(value) =>
+              updateOverlay({
+                showBottomLeftSlogan: value === "show",
+              })
+            }
+          >
+            <option value="show">Show</option>
+            <option value="hide">Hide</option>
+          </SelectField>
+          <SelectField
+            label="Top left logo"
+            value={overlay.showTopLogo ? "show" : "hide"}
+            onChange={(value) => updateOverlay({ showTopLogo: value === "show" })}
+          >
+            <option value="show">Show</option>
+            <option value="hide">Hide</option>
+          </SelectField>
+        </>
+      )}
       <SelectField
         label="Tone"
         value={overlay.tone}
@@ -2394,26 +2843,127 @@ function OverlaySettings({ onChange, overlay }: OverlayControlProps) {
 
 type SelectFieldProps = {
   children: ReactNode;
+  disabled?: boolean;
   label: string;
   onChange: (value: string) => void;
   value: string;
 };
 
-function SelectField({ children, label, onChange, value }: SelectFieldProps) {
+function SelectField({
+  children,
+  disabled = false,
+  label,
+  onChange,
+  value,
+}: SelectFieldProps) {
+  const [isOpen, setIsOpen] = useState(false);
+  const menuRef = useRef<HTMLDivElement | null>(null);
+  const labelId = useId();
+  const options = getSelectOptions(children);
+  const selectedOption =
+    options.find((option) => option.value === value) ?? options[0];
+
+  useEffect(() => {
+    if (!isOpen) {
+      return;
+    }
+
+    const closeOnPointerDown = (event: globalThis.PointerEvent) => {
+      if (!menuRef.current?.contains(event.target as Node)) {
+        setIsOpen(false);
+      }
+    };
+    const closeOnEscape = (event: globalThis.KeyboardEvent) => {
+      if (event.key === "Escape") {
+        setIsOpen(false);
+      }
+    };
+
+    document.addEventListener("pointerdown", closeOnPointerDown);
+    document.addEventListener("keydown", closeOnEscape);
+
+    return () => {
+      document.removeEventListener("pointerdown", closeOnPointerDown);
+      document.removeEventListener("keydown", closeOnEscape);
+    };
+  }, [isOpen]);
+
+  const selectOption = (nextValue: string) => {
+    onChange(nextValue);
+    setIsOpen(false);
+  };
+
   return (
-    <label className="grid gap-2">
-      <span className="text-xs font-bold uppercase text-[var(--muted-foreground)]">
+    <div
+      className={cn("relative grid gap-2", disabled && "opacity-55")}
+      ref={menuRef}
+    >
+      <span
+        className="text-xs font-bold uppercase text-[var(--muted-foreground)]"
+        id={labelId}
+      >
         {label}
       </span>
-      <select
-        className="min-h-10 rounded-md border border-[var(--border)] bg-[var(--background)] px-3 text-sm font-semibold text-[var(--foreground)] outline-none transition focus-visible:ring-2 focus-visible:ring-[var(--ring)]"
-        value={value}
-        onChange={(event) => onChange(event.currentTarget.value)}
+      <button
+        aria-label={label}
+        aria-controls={`${labelId}-listbox`}
+        aria-expanded={isOpen}
+        aria-haspopup="listbox"
+        className="grid min-h-10 w-full grid-cols-[minmax(0,1fr)_1rem] items-center gap-3 rounded-md border border-[var(--border)] bg-[var(--background)] px-3 text-left text-sm font-semibold text-[var(--foreground)] outline-none transition hover:bg-[var(--accent)] disabled:cursor-not-allowed disabled:opacity-70 focus-visible:ring-2 focus-visible:ring-[var(--ring)]"
+        disabled={disabled}
+        role="combobox"
+        type="button"
+        onClick={() => setIsOpen((currentValue) => !currentValue)}
       >
-        {children}
-      </select>
-    </label>
+        <span className="truncate">
+          {selectedOption?.label ?? value}
+        </span>
+        <ChevronDown
+          aria-hidden="true"
+          className={cn(
+            "size-4 justify-self-center text-[var(--muted-foreground)] transition-transform",
+            isOpen && "rotate-180",
+          )}
+        />
+      </button>
+      {isOpen ? (
+        <div
+          className="absolute left-0 right-0 top-[calc(100%+6px)] z-50 rounded-md border border-[var(--border)] bg-[var(--popover)] p-1 text-[var(--popover-foreground)] shadow-lg"
+          id={`${labelId}-listbox`}
+          role="listbox"
+        >
+          {options.map((option) => (
+            <button
+              aria-selected={option.value === value}
+              className="grid min-h-9 w-full grid-cols-[1rem_minmax(0,1fr)] items-center gap-3 rounded px-3 text-left text-sm font-semibold transition hover:bg-[var(--accent)] focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-[var(--ring)]"
+              key={option.value}
+              role="option"
+              type="button"
+              onClick={() => selectOption(option.value)}
+            >
+              <span className="flex size-4 items-center justify-center">
+                {option.value === value ? (
+                  <Check className="size-4 shrink-0" aria-hidden="true" />
+                ) : null}
+              </span>
+              <span>{option.label}</span>
+            </button>
+          ))}
+        </div>
+      ) : null}
+    </div>
   );
+}
+
+function getSelectOptions(children: ReactNode) {
+  return Children.toArray(children)
+    .filter((child): child is ReactElement<{ children: ReactNode; value?: string }> =>
+      isValidElement(child),
+    )
+    .map((child) => ({
+      label: String(child.props.children ?? child.props.value ?? ""),
+      value: String(child.props.value ?? child.props.children ?? ""),
+    }));
 }
 
 function SceneSlogan({
@@ -2460,49 +3010,56 @@ function VisualOverlayMark({
   audioLevel,
   frameShape,
   overlay,
+  waveformStyle,
 }: {
   audioSpectrum: number[];
   audioLevel: number;
   frameShape: FrameShape;
   overlay: VisualOverlay;
+  waveformStyle: WaveformStyle;
 }) {
-  if (overlay.asset === "waveform") {
+  const renderOverlay = getRenderableOverlay(overlay);
+
+  if (renderOverlay.asset === "waveform") {
     return (
       <SoundWaveOverlay
         audioSpectrum={audioSpectrum}
         audioLevel={audioLevel}
-        tone={overlay.tone}
+        tone={renderOverlay.tone}
+        waveformStyle={waveformStyle}
       />
     );
   }
 
-  const overlaySource = getOverlayDataUrl(overlay);
+  const overlaySource = getOverlayDataUrl(renderOverlay);
 
   if (!overlaySource) {
     return null;
   }
 
   const overlayStyle = {
-    "--overlay-audio-level": audioLevel.toFixed(3),
+    "--center-logo-size": `${getCenterLogoSizePercent(renderOverlay)}%`,
+    "--overlay-audio-level": renderOverlay.centerLogoOnly ? "0" : audioLevel.toFixed(3),
   } as CSSProperties;
 
   // Padidinam star overlay 1.5 karto TIK circle formate
-  const extraScale = overlay.asset === "star" && frameShape === "circle" ? 1.5 : 1;
+  const extraScale = renderOverlay.asset === "star" && frameShape === "circle" ? 1.5 : 1;
   return (
     <span
       className={cn(
         "visual-overlay pointer-events-none absolute left-1/2 top-1/2 z-10 select-none",
         `visual-overlay-${frameShape}`,
-        overlay.asset === "star"
+        renderOverlay.asset === "star"
           ? "visual-overlay-star w-[35%] min-w-16 max-w-48"
           : "visual-overlay-logo w-[62%] max-w-[320px]",
+        renderOverlay.centerLogoOnly && "visual-overlay-logo-only",
       )}
       style={{
         ...overlayStyle,
         transform: `translate(-50%, -50%) scale(${extraScale})`,
       }}
     >
-      {overlay.asset === "star" ? (
+      {renderOverlay.asset === "star" ? (
         <img
           alt=""
           aria-hidden="true"
@@ -2519,13 +3076,15 @@ function SoundWaveOverlay({
   audioSpectrum,
   audioLevel,
   tone,
+  waveformStyle,
 }: {
   audioSpectrum: number[];
   audioLevel: number;
   tone: OverlayTone;
+  waveformStyle: WaveformStyle;
 }) {
   void audioLevel;
-  const style = getWaveformStyle();
+  const style = getWaveformStyle(waveformStyle);
   const noiseFloor = style.noiseFloor;
   const totalBars = 64;
   const halfBars = totalBars / 2;
@@ -2535,6 +3094,9 @@ function SoundWaveOverlay({
   const widthFactor = style.widthFactor;
   const centerGain = style.centerGain;
   const edgeGain = style.edgeGain;
+  const waveformCssVars = {
+    "--waveform-style-box-scale": style.boxScale.toFixed(3),
+  } as CSSProperties;
   if (style.useStarProfile) {
     const frameMax = audioSpectrum.reduce(
       (m, b) => Math.max(m, Math.max(0, (b - noiseFloor) / (1 - noiseFloor))),
@@ -2563,10 +3125,10 @@ function SoundWaveOverlay({
     const bell = 1 + style.bellBoost * (1 - centerDistance) ** 6;
     const height = style.useStarProfile
       ? (normalizedBand / _starNormalizedPeak) * (STAR_BAR_PROFILE[mirroredIndex] ?? 1) * 100
-      : Math.max(0, Math.min(1, effectiveBand)) * 100 * bell;
+      : Math.max(0, Math.min(1, effectiveBand)) * 100 * bell * style.verticalGain;
     const opacity = getWaveformBarOpacity(mirroredIndex);
     return {
-      height: Math.max(0, height),
+      height: Math.min(165, Math.max(0, height)),
       opacity,
     };
   });
@@ -2577,6 +3139,7 @@ function SoundWaveOverlay({
         "sound-wave-overlay pointer-events-none absolute left-1/2 top-1/2 z-10 select-none",
         tone === "dark" && "sound-wave-overlay-dark",
       )}
+      style={waveformCssVars}
     >
       <span className="sound-wave-overlay-track">
         {bars.map((bar, index) => (
@@ -2597,6 +3160,10 @@ function SceneDecorations({
 }: {
   overlay: VisualOverlay;
 }) {
+  if (overlay.centerLogoOnly) {
+    return null;
+  }
+
   const isLight = overlay.tone !== "dark";
   const textColor = isLight ? "text-white" : "text-[#01151e]";
   const hasRightContent = overlay.showBottomCta;
@@ -3062,6 +3629,28 @@ function getLoopFadeAmount(elapsedMs: number, durationMs: number) {
   return progress * progress * (3 - 2 * progress);
 }
 
+function getAutoRandomizeDelayMs(interval: AutoRandomizeInterval) {
+  if (interval === "random") {
+    const randomInterval =
+      autoRandomizeIntervals[Math.floor(Math.random() * autoRandomizeIntervals.length)] ??
+      10;
+
+    return randomInterval * 1000;
+  }
+
+  return Number(interval) * 1000;
+}
+
+function autoRandomizeIntervalOptions() {
+  return [
+    ...autoRandomizeIntervals.map((interval) => ({
+      label: `${interval}s`,
+      value: interval.toString() as AutoRandomizeInterval,
+    })),
+    { label: "Random", value: "random" as const },
+  ];
+}
+
 function waitForNextAnimationFrame() {
   return new Promise<void>((resolve) => {
     window.requestAnimationFrame(() => resolve());
@@ -3155,6 +3744,30 @@ function getPreviewFrameClass(label: string) {
   return "format-frame-square";
 }
 
+function getRenderableOverlay(overlay: VisualOverlay): VisualOverlay {
+  if (overlay.centerLogoOnly) {
+    return {
+      ...overlay,
+      asset: "logo",
+      centerLogoOnly: true,
+      centerLogoSize: overlay.centerLogoSize,
+      showBottomCta: false,
+      showBottomLeftSlogan: false,
+      showTopLogo: false,
+    };
+  }
+
+  return {
+    ...overlay,
+    asset: "waveform",
+    centerLogoOnly: false,
+    centerLogoSize: overlay.centerLogoSize,
+  };
+}
+
+function getCenterLogoSizePercent(overlay: VisualOverlay) {
+  return overlay.centerLogoSize === "50" ? 50 : 33;
+}
 
 function formatSlug(formatToSlug: FormatConfig) {
   return formatToSlug.label.replace(":", "x").toLowerCase();
@@ -3164,6 +3777,13 @@ async function captureTargetPng(
   handle: ShaderStageHandle,
   scale: 1 | 2,
   format: FormatConfig,
+  overlay: VisualOverlay,
+  audioSpectrum: number[],
+  audioLevel: number,
+  overlayImage: HTMLImageElement | null,
+  qrImage: HTMLImageElement | null,
+  topLogoImage: HTMLImageElement | null,
+  waveformStyle: WaveformStyle,
 ) {
   const canvas = handle.getCanvas();
 
@@ -3190,6 +3810,15 @@ async function captureTargetPng(
   context.imageSmoothingEnabled = true;
   context.imageSmoothingQuality = "high";
   context.drawImage(canvas, 0, 0, exportCanvas.width, exportCanvas.height);
+  drawOverlay(context, exportCanvas.width, exportCanvas.height, {
+    audioLevel,
+    audioSpectrum,
+    image: overlayImage,
+    qrImage,
+    topLogoImage,
+    overlay,
+    waveformStyle,
+  });
 
   return exportCanvas.toDataURL("image/png");
 }
@@ -3245,9 +3874,18 @@ function drawOverlay(
     qrImage: HTMLImageElement | null;
     topLogoImage: HTMLImageElement | null;
     overlay: VisualOverlay;
+    waveformStyle: WaveformStyle;
   },
 ) {
-  const { audioLevel, audioSpectrum, image, qrImage, topLogoImage, overlay } = options;
+  const {
+    audioLevel,
+    audioSpectrum,
+    image,
+    qrImage,
+    topLogoImage,
+    overlay,
+    waveformStyle,
+  } = options;
   void audioLevel;
   const color = overlay.tone === "dark" ? "#020617" : "#ffffff";
 
@@ -3262,11 +3900,16 @@ function drawOverlay(
       height,
       audioSpectrum,
       color,
+      waveformStyle,
     );
   } else if (image && overlay.asset !== "none") {
     const imageRatio = image.naturalWidth / image.naturalHeight;
-    const maxWidth = overlay.asset === "star" ? width * 0.22 : width * 0.62;
-    const maxHeight = overlay.asset === "star" ? height * 0.22 : height * 0.22;
+    const maxWidth = overlay.asset === "star"
+      ? width * 0.22
+      : width * (overlay.centerLogoOnly ? getCenterLogoSizePercent(overlay) / 100 : 0.62);
+    const maxHeight = overlay.asset === "star"
+      ? height * 0.22
+      : height * (overlay.centerLogoOnly ? getCenterLogoSizePercent(overlay) / 100 : 0.22);
     let drawWidth = maxWidth;
     let drawHeight = drawWidth / imageRatio;
 
@@ -3287,7 +3930,10 @@ function drawOverlay(
   context.globalAlpha = 1;
   context.filter = "none";
 
-  if (overlay.showTopLogo || overlay.showBottomLeftSlogan || overlay.showBottomCta) {
+  if (
+    !overlay.centerLogoOnly &&
+    (overlay.showTopLogo || overlay.showBottomLeftSlogan || overlay.showBottomCta)
+  ) {
     drawSceneBottomBar(
       context, width, height, overlay.tone,
       overlay.showTopLogo ? topLogoImage : null,
@@ -3307,8 +3953,9 @@ function drawWaveformOverlay(
   height: number,
   audioSpectrum: number[],
   color: string,
+  waveformStyle: WaveformStyle,
 ) {
-  const style = getWaveformStyle();
+  const style = getWaveformStyle(waveformStyle);
   const totalBars = 64;
   const halfBars = totalBars / 2;
   const noiseFloor = style.noiseFloor;
@@ -3318,7 +3965,7 @@ function drawWaveformOverlay(
   const widthFactor = style.widthFactor;
   const centerGain = style.centerGain;
   const edgeGain = style.edgeGain;
-  const sceneWaveBounds = getSceneWaveBounds(width, height);
+  const sceneWaveBounds = getSceneWaveBounds(width, height, style);
   const overlayWidth = sceneWaveBounds.width;
   const overlayHeight = sceneWaveBounds.height;
   const waveformAmplitudeScale = sceneWaveBounds.amplitudeScale;
@@ -3355,12 +4002,13 @@ function drawWaveformOverlay(
         normalizedBand * sideMotionMix + normalizedBand * centerEnvelope * (1 - sideMotionMix);
       const boostedBand = Math.max(0, Math.min(1, effectiveBand * gain * style.verticalGain));
       const bell = 1 + style.bellBoost * (1 - centerDistance) ** 6;
-      const barHeight = style.useStarProfile
+      const rawBarHeight = style.useStarProfile
         ? (normalizedBand / _starNormalizedPeak) *
           (STAR_BAR_PROFILE[mirroredIndex] ?? 1) *
           overlayHeight *
           waveformAmplitudeScale
         : boostedBand * overlayHeight * bell * waveformAmplitudeScale;
+      const barHeight = Math.min(overlayHeight * 1.65, rawBarHeight);
 
       if (barHeight <= 0) {
         continue;
@@ -3385,6 +4033,7 @@ function drawVisiblePreviewOverlay(
   audioSpectrum: number[],
   overlay: VisualOverlay,
   topLogoImage: HTMLImageElement | null,
+  waveformStyle: WaveformStyle,
 ) {
   const frameElement = getVisibleFormatFrame(formatLabel);
 
@@ -3396,8 +4045,12 @@ function drawVisiblePreviewOverlay(
   context.globalAlpha = 1;
   context.filter = "none";
 
+  let needsFallback = false;
+
   if (overlay.asset === "waveform") {
-    drawVisibleWaveform(context, frameElement, audioSpectrum, overlay.tone);
+    drawVisibleWaveform(context, frameElement, audioSpectrum, overlay.tone, waveformStyle);
+  } else if (overlay.asset !== "none") {
+    needsFallback = !drawVisibleCenterOverlay(context, frameElement);
   }
 
   if (overlay.showTopLogo && topLogoImage) {
@@ -3410,7 +4063,7 @@ function drawVisiblePreviewOverlay(
 
   context.restore();
 
-  return true;
+  return !needsFallback;
 }
 
 function getVisibleFormatFrame(formatLabel: string) {
@@ -3442,6 +4095,7 @@ function drawVisibleWaveform(
   frameElement: HTMLElement,
   audioSpectrum: number[],
   tone: OverlayTone,
+  waveformStyle: WaveformStyle,
 ) {
   const waveElement = frameElement.querySelector<HTMLElement>(".sound-wave-overlay");
   const trackElement = frameElement.querySelector<HTMLElement>(".sound-wave-overlay-track");
@@ -3451,7 +4105,7 @@ function drawVisibleWaveform(
     return;
   }
 
-  const style = getWaveformStyle();
+  const style = getWaveformStyle(waveformStyle);
   const totalBars = 64;
   const halfBars = totalBars / 2;
   const noiseFloor = style.noiseFloor;
@@ -3506,7 +4160,10 @@ function drawVisibleWaveform(
       normalizedBand * sideMotionMix + normalizedBand * centerEnvelope * (1 - sideMotionMix);
     const effectiveBand = Math.max(0, Math.min(1, shapedBand * gain));
     const bell = 1 + style.bellBoost * (1 - centerDistance) ** 6;
-    const barHeight = Math.max(0, effectiveBand * waveRect.height * bell);
+    const barHeight = Math.min(
+      waveRect.height * 1.65,
+      Math.max(0, effectiveBand * waveRect.height * bell * style.verticalGain),
+    );
 
     if (barHeight <= 0) {
       continue;
@@ -3538,6 +4195,30 @@ function drawVisibleLogo(
   context.globalAlpha = 1;
   context.filter = "none";
   context.drawImage(topLogoImage, rect.x, rect.y, rect.width, rect.height);
+}
+
+function drawVisibleCenterOverlay(
+  context: CanvasRenderingContext2D,
+  frameElement: HTMLElement,
+) {
+  const overlayElement = frameElement.querySelector<HTMLElement>(".visual-overlay");
+  const imageElement = frameElement.querySelector<HTMLImageElement>(".visual-overlay-mark");
+
+  if (
+    !overlayElement ||
+    !imageElement ||
+    !imageElement.complete ||
+    imageElement.naturalWidth <= 0
+  ) {
+    return false;
+  }
+
+  const rect = getExportRect(overlayElement, frameElement, context.canvas.width, context.canvas.height);
+  context.globalAlpha = 1;
+  context.filter = "none";
+  context.drawImage(imageElement, rect.x, rect.y, rect.width, rect.height);
+
+  return true;
 }
 
 function drawVisibleBottomContent(
@@ -3644,6 +4325,7 @@ function setCanvasLetterSpacing(
 function getSceneWaveBounds(
   width: number,
   height: number,
+  waveformStyle: WaveformStyle = getWaveformStyle(),
 ) {
   const ratio = width / height;
   const isSquare = Math.abs(ratio - 1) < 0.01;
@@ -3659,12 +4341,12 @@ function getSceneWaveBounds(
         : 1;
   const overlayWidth =
     isSquare || isThreeByFour || isNineBySixteen
-      ? width * 0.5 * waveformBoxScale
-      : width * 0.78;
+      ? width * 0.5 * waveformBoxScale * waveformStyle.boxScale
+      : width * 0.78 * waveformStyle.boxScale;
   const overlayHeight =
     isSquare || isThreeByFour || isNineBySixteen
-      ? height * 0.32 * waveformBoxScale
-      : height * 0.32;
+      ? height * 0.32 * waveformBoxScale * waveformStyle.boxScale
+      : height * 0.32 * waveformStyle.boxScale;
 
   return {
     amplitudeScale: focusedWaveformAmplitudeScale,
@@ -3965,8 +4647,73 @@ function downloadBlob(blob: Blob, filename: string) {
 
   link.download = filename;
   link.href = url;
+  document.body.appendChild(link);
   link.click();
-  window.setTimeout(() => URL.revokeObjectURL(url), 0);
+  link.remove();
+  window.setTimeout(() => URL.revokeObjectURL(url), 60_000);
+}
+
+async function createZipBlob(files: Array<{ blob: Blob; filename: string }>) {
+  const encoder = new TextEncoder();
+  const localParts: BlobPart[] = [];
+  const centralParts: BlobPart[] = [];
+  let localOffset = 0;
+
+  for (const file of files) {
+    const filename = encoder.encode(file.filename);
+    const bytes = new Uint8Array(await file.blob.arrayBuffer());
+    const checksum = crc32(bytes);
+    const localHeader = new Uint8Array(30 + filename.length);
+    const localView = new DataView(localHeader.buffer);
+    localView.setUint32(0, 0x04034b50, true);
+    localView.setUint16(4, 20, true);
+    localView.setUint16(6, 0x0800, true);
+    localView.setUint32(14, checksum, true);
+    localView.setUint32(18, bytes.length, true);
+    localView.setUint32(22, bytes.length, true);
+    localView.setUint16(26, filename.length, true);
+    localHeader.set(filename, 30);
+    localParts.push(localHeader, bytes);
+
+    const centralHeader = new Uint8Array(46 + filename.length);
+    const centralView = new DataView(centralHeader.buffer);
+    centralView.setUint32(0, 0x02014b50, true);
+    centralView.setUint16(4, 20, true);
+    centralView.setUint16(6, 20, true);
+    centralView.setUint16(8, 0x0800, true);
+    centralView.setUint32(16, checksum, true);
+    centralView.setUint32(20, bytes.length, true);
+    centralView.setUint32(24, bytes.length, true);
+    centralView.setUint16(28, filename.length, true);
+    centralView.setUint32(42, localOffset, true);
+    centralHeader.set(filename, 46);
+    centralParts.push(centralHeader);
+    localOffset += localHeader.length + bytes.length;
+  }
+
+  const centralSize = centralParts.reduce((total, part) => total + (part as Uint8Array).length, 0);
+  const endRecord = new Uint8Array(22);
+  const endView = new DataView(endRecord.buffer);
+  endView.setUint32(0, 0x06054b50, true);
+  endView.setUint16(8, files.length, true);
+  endView.setUint16(10, files.length, true);
+  endView.setUint32(12, centralSize, true);
+  endView.setUint32(16, localOffset, true);
+
+  return new Blob([...localParts, ...centralParts, endRecord], { type: "application/zip" });
+}
+
+function crc32(bytes: Uint8Array) {
+  let crc = 0xffffffff;
+
+  for (const byte of bytes) {
+    crc ^= byte;
+    for (let bit = 0; bit < 8; bit += 1) {
+      crc = (crc >>> 1) ^ (0xedb88320 & -(crc & 1));
+    }
+  }
+
+  return (crc ^ 0xffffffff) >>> 0;
 }
 
 function getSupportedVideoMimeType(videoFormat: VideoExportFormat) {
@@ -4245,7 +4992,15 @@ function normalizeOverlay(value: unknown): VisualOverlay {
     return { ...defaultVisualOverlay };
   }
 
-  const asset = "waveform";
+  const centerLogoOnly =
+    typeof value.centerLogoOnly === "boolean"
+      ? value.centerLogoOnly
+      : defaultVisualOverlay.centerLogoOnly;
+  const asset = centerLogoOnly ? "logo" : "waveform";
+  const centerLogoSize =
+    value.centerLogoSize === "33" || value.centerLogoSize === "50"
+      ? value.centerLogoSize
+      : defaultVisualOverlay.centerLogoSize;
   const tone =
     value.tone === "light" || value.tone === "dark"
       ? value.tone
@@ -4270,7 +5025,17 @@ function normalizeOverlay(value: unknown): VisualOverlay {
     typeof value.showBottomCta === "boolean"
       ? value.showBottomCta
       : defaultVisualOverlay.showBottomCta;
-  return { asset, bottomRight, showBottomCta, showBottomLeftSlogan, showTopLogo, tone };
+
+  return {
+    asset,
+    bottomRight,
+    centerLogoOnly,
+    centerLogoSize,
+    showBottomCta,
+    showBottomLeftSlogan,
+    showTopLogo,
+    tone,
+  };
 }
 
 function ensureDefaultSection(sections: GallerySection[]) {
@@ -4309,9 +5074,10 @@ function finiteNumber(value: unknown, fallback: number) {
   return typeof value === "number" && Number.isFinite(value) ? value : fallback;
 }
 
-function getWaveformStyle() {
+function getWaveformStyle(overrides: Partial<WaveformStyle> = {}): WaveformStyle {
   return {
     bellBoost: 1.2,
+    boxScale: 1,
     centerEnvelopePower: 3,
     centerGain: 1.5,
     edgeGain: 1,
@@ -4321,7 +5087,64 @@ function getWaveformStyle() {
     useStarProfile: false,
     verticalGain: 1.0,
     widthFactor: 1,
+    ...overrides,
   };
+}
+
+function createRandomWaveformStyle(): WaveformStyle {
+  const profiles = [
+    () => getWaveformStyle({
+      bellBoost: randomBetween(2.4, 4.2),
+      boxScale: randomBetween(0.82, 1.08),
+      centerEnvelopePower: randomBetween(2.8, 6.2),
+      centerGain: randomBetween(2.2, 4.6),
+      edgeGain: randomBetween(0.25, 0.78),
+      noiseFloor: randomBetween(0, 0.045),
+      sideFloor: randomBetween(0.02, 0.14),
+      sideMotionMix: randomBetween(0, 0.14),
+      verticalGain: randomBetween(1.35, 2.75),
+      widthFactor: randomBetween(0.56, 0.9),
+    }),
+    () => getWaveformStyle({
+      bellBoost: randomBetween(0.1, 0.9),
+      boxScale: randomBetween(1.02, 1.28),
+      centerEnvelopePower: randomBetween(0.75, 1.55),
+      centerGain: randomBetween(1.15, 2.15),
+      edgeGain: randomBetween(1.0, 2.35),
+      noiseFloor: randomBetween(0, 0.035),
+      sideFloor: randomBetween(0.28, 0.62),
+      sideMotionMix: randomBetween(0.42, 0.85),
+      verticalGain: randomBetween(0.75, 1.65),
+      widthFactor: randomBetween(1.02, 1.45),
+    }),
+    () => getWaveformStyle({
+      bellBoost: randomBetween(1.5, 3.5),
+      boxScale: randomBetween(0.9, 1.18),
+      centerEnvelopePower: randomBetween(1.2, 2.8),
+      centerGain: randomBetween(1.55, 3.25),
+      edgeGain: randomBetween(0.7, 1.65),
+      noiseFloor: randomBetween(0, 0.06),
+      sideFloor: randomBetween(0.12, 0.35),
+      sideMotionMix: randomBetween(0.16, 0.46),
+      verticalGain: randomBetween(1.15, 2.45),
+      widthFactor: randomBetween(0.78, 1.22),
+    }),
+    () => getWaveformStyle({
+      bellBoost: randomBetween(3.0, 5.0),
+      boxScale: randomBetween(0.76, 1.06),
+      centerEnvelopePower: randomBetween(5.2, 9.0),
+      centerGain: randomBetween(2.6, 5.4),
+      edgeGain: randomBetween(0.18, 0.62),
+      noiseFloor: randomBetween(0.015, 0.08),
+      sideFloor: randomBetween(0, 0.08),
+      sideMotionMix: randomBetween(0, 0.08),
+      verticalGain: randomBetween(1.55, 3.15),
+      widthFactor: randomBetween(0.7, 1.12),
+    }),
+  ];
+  const profile = profiles[Math.floor(Math.random() * profiles.length)] ?? profiles[0];
+
+  return profile();
 }
 
 function sampleSpectrumLevels(

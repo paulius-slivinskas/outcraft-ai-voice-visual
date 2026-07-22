@@ -43,6 +43,8 @@ const fallbackFormat: FormatConfig = {
 const fallbackOverlay: VisualOverlay = {
   asset: "logo",
   bottomRight: "button",
+  centerLogoOnly: true,
+  centerLogoSize: "33",
   showBottomCta: false,
   showBottomLeftSlogan: false,
   showTopLogo: false,
