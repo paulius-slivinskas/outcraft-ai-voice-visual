@@ -4,6 +4,8 @@ import {
   initialBackgroundColor,
   initialBlobs,
   initialMesh,
+  presetAudioReactivity,
+  presetAudioSmoothness,
 } from "../data/palette";
 import { getOutcraftLogoDataUrl } from "../lib/brandAssets";
 import type {
@@ -232,8 +234,8 @@ function normalizeMesh(mesh: MeshConfig): MeshConfig {
   return {
     ...fallbackVisual.mesh,
     ...mesh,
-    audioReactivity: finiteNumber(mesh.audioReactivity, initialMesh.audioReactivity),
-    audioSmoothness: finiteNumber(mesh.audioSmoothness, initialMesh.audioSmoothness),
+    audioReactivity: presetAudioReactivity,
+    audioSmoothness: presetAudioSmoothness,
     distortion: finiteNumber(mesh.distortion, initialMesh.distortion),
     frame: finiteNumber(mesh.frame, initialMesh.frame),
     grainMixer: finiteNumber(mesh.grainMixer, initialMesh.grainMixer),

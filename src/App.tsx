@@ -1,6 +1,8 @@
 import { ShaderStage, type ShaderStageHandle } from "./components/ShaderStage";
 import { Button } from "./components/ui/button";
 import { Slider } from "./components/ui/slider";
+import { loadAudioBuffer } from "./export/loadAudioBuffer";
+import { prepareVideoOutputDestination } from "./export/outputDestination";
 import {
   fixedGrainMixer,
   fixedGrainOverlay,
@@ -8,7 +10,43 @@ import {
   initialBlobs,
   initialMesh,
   paletteGroups,
+  presetAudioReactivity,
+  presetAudioSmoothness,
 } from "./data/palette";
+import { ShaderClock } from "./lib/ShaderClock";
+import { ShaderRenderer } from "./lib/ShaderRenderer";
+import { getAudioEnvelope } from "./lib/audioEnvelope";
+import {
+  configureLiveAudioAnalyser,
+  createLiveAudioSpectrumState,
+  updateLiveAudioSpectrum,
+  type LiveAudioSpectrumState,
+} from "./lib/audioSpectrum";
+import {
+  createWaveformBars,
+  getWaveformBarGlowOpacity,
+  getWaveformBarLayerOpacities,
+  getWaveformStyle,
+  WAVEFORM_AMPLITUDE_SCALE,
+  WAVEFORM_EDGE_BLUR_MAX_RATIO,
+  WAVEFORM_GLOW_BLUR_MAX_RATIO,
+  type WaveformStyle,
+} from "./lib/waveformBars";
+import {
+  getWaveformAmplitudeScale,
+  getWaveformBarCount,
+  getWaveformBarOffset,
+  getWaveformGeometry,
+  getWaveformGlowHeight,
+  getWaveformMaxPeakHeight,
+  getWaveformRenderedBarHeight,
+  getWaveformRenderedBarCenterOffset,
+  getWaveformRenderedBarOpacityScale,
+  getWaveformRenderedBarWidth,
+} from "./lib/waveformGeometry";
+import {
+  getSceneHorizontalPadding,
+} from "./lib/sceneGeometry";
 import { cn } from "./lib/utils";
 import type {
   BlobConfig,
@@ -64,7 +102,14 @@ const singleFormatOptions = [
 ] as const;
 
 const formatOptions = singleFormatOptions;
+const allExportFormatLabels = singleFormatOptions.map((option) => option.label);
 const meshFrameMax = 500000;
+const timelineScrubCenter = meshFrameMax / 2;
+const videoPreparationProgressWeight = 0.08;
+const microphoneCaptureProgressWeight = 0.06;
+const videoFormatMaxAttempts = 2;
+const videoFormatStallTimeoutMs = 90_000;
+const videoEncoderRecoveryDelayMs = 400;
 const defaultVisualOverlay: VisualOverlay = {
   asset: "waveform",
   bottomRight: "button",
@@ -92,10 +137,27 @@ type VideoExportOptions = {
   isLoopable: boolean;
 };
 type VideoExportProgress = {
+  attempt: number;
+  completedFormats: number;
   formatLabel: string;
   formatIndex: number;
+  maxAttempts: number;
+  overallProgress: number;
   progress: number;
   totalFormats: number;
+};
+type VideoExportNotice = {
+  kind: "error" | "success";
+  message: string;
+};
+type CompletedVideoExportFormat = {
+  filename: string;
+  formatLabel: string;
+  sizeBytes: number;
+};
+type FailedVideoExportFormat = {
+  formatLabel: string;
+  reason: string;
 };
 type GallerySaveStatus = "loading" | "saving" | "saved" | "error";
 type MusicStatus = "idle" | "loading" | "playing";
@@ -112,84 +174,45 @@ type GalleryState = {
   items: VisualSnapshot[];
   sections: GallerySection[];
 };
-type WaveformStyle = {
-  bellBoost: number;
-  boxScale: number;
-  centerEnvelopePower: number;
-  centerGain: number;
-  edgeGain: number;
-  noiseFloor: number;
-  sideFloor: number;
-  sideMotionMix: number;
-  useStarProfile: boolean;
-  verticalGain: number;
-  widthFactor: number;
+type GalleryDocument = {
+  revision: string | null;
+  state: GalleryState;
 };
-
+type GalleryWriteResult = {
+  revision: string | null;
+  state: GalleryState;
+};
 const galleryApiPath = "/api/gallery";
 const staticGalleryPath = "data/gallery.json";
 const legacyGalleryStorageKey = "outcraft.gallery.v1";
+const galleryConflictRetryLimit = 4;
 const themeStorageKey = "outcraft.ui-theme.v1";
 const sampleAudioPath =
   "/audio/019e083a-6191-7000-b905-5d72c6a03184-1778254690727-af155e06-25ca-4c6b-89ce-577ba10962fd-stereo.mp3";
-const focusedWaveformAmplitudeScale = 1;
-const exportAudioLookaheadSeconds = 0.1;
-const exportAudioBitsPerSecond = 96000;
 const autoRandomizeIntervals = [5, 10, 15] as const;
-
-// Running peak tracker for star-profile modes — normalizes bars so full star forms at track peak.
-let _starNormalizedPeak = 0.1;
-
-// Precomputed star silhouette profile for each of the 32 half-bar positions (0=center, 31=edge).
-// Derived from the actual SVG bezier curves: for each bar's x position, the normalized visible
-// height of the star shape (fraction of container height, capped at 1.0).
-const STAR_BAR_PROFILE: readonly number[] = (() => {
-  // Upper-right bezier segments of the star path
-  const bez1 = [[45.036, 2.046], [45.35, 13.29], [47.67, 21.64], [52.833, 27.237]] as const;
-  const bez2 = [[52.833, 27.237], [57.963, 32.800], [66.058, 35.791], [77.964, 36.373]] as const;
-
-  const evalBez = (p: readonly (readonly [number, number])[], t: number): [number, number] => {
-    const u = 1 - t;
-    return [
-      u*u*u*p[0][0] + 3*u*u*t*p[1][0] + 3*u*t*t*p[2][0] + t*t*t*p[3][0],
-      u*u*u*p[0][1] + 3*u*u*t*p[1][1] + 3*u*t*t*p[2][1] + t*t*t*p[3][1],
-    ];
-  };
-
-  const solveT = (p: readonly (readonly [number, number])[], targetX: number): number => {
-    let t = (targetX - p[0][0]) / (p[3][0] - p[0][0]);
-    for (let i = 0; i < 12; i++) {
-      const [x] = evalBez(p, t);
-      const dx = 3 * (
-        (1-t)*(1-t)*(p[1][0]-p[0][0]) +
-        2*(1-t)*t*(p[2][0]-p[1][0]) +
-        t*t*(p[3][0]-p[2][0])
-      );
-      const dt = dx === 0 ? 0 : (x - targetX) / dx;
-      t = Math.max(0, Math.min(1, t - dt));
-      if (Math.abs(dt) < 1e-7) break;
-    }
-    return t;
-  };
-
-  return Array.from({ length: 32 }, (_, i) => {
-    // Each bar maps to SVG x in [40.5, 81] (full right half of star at mask-size 100%)
-    const xSvg = 40.5 + i * (40.5 / 31);
-    // Outside star's right boundary
-    if (xSvg > 80.012) return 0;
-    // Flat-top region (top tip): full height
-    if (xSvg <= 45.036) return 1.0;
-    // Short line segment from arm to right tip — nearly flat
-    if (xSvg >= 77.964) {
-      const yTop = 36.373 + (xSvg - 77.964) * (36.4727 - 36.373) / (80.012 - 77.964);
-      return Math.max(0, (84 - 2 * yTop) / 84);
-    }
-    // Bezier arm segments
-    const pts = xSvg <= 52.833 ? bez1 : bez2;
-    const [, yTop] = evalBez(pts, solveT(pts, xSvg));
-    return Math.min(1, Math.max(0, (84 - 2 * yTop) / 84));
-  });
-})();
+const blurredBackdropCache = new WeakMap<
+  CanvasRenderingContext2D,
+  {
+    canvas: HTMLCanvasElement;
+    context: CanvasRenderingContext2D;
+  }
+>();
+const waveformBlurLayerCache = new WeakMap<
+  CanvasRenderingContext2D,
+  {
+    canvas: HTMLCanvasElement;
+    context: CanvasRenderingContext2D;
+  }
+>();
+const waveformGlowLayerCache = new WeakMap<
+  CanvasRenderingContext2D,
+  {
+    canvas: HTMLCanvasElement;
+    color: string;
+    context: CanvasRenderingContext2D;
+    sprite: HTMLCanvasElement;
+  }
+>();
 const defaultGallerySection: GallerySection = {
   id: "favorites",
   isOpen: true,
@@ -197,6 +220,9 @@ const defaultGallerySection: GallerySection = {
 };
 
 function App() {
+  const [shaderClock] = useState(
+    () => new ShaderClock(normalizeMesh(initialMesh).frame),
+  );
   const stageRef = useRef<ShaderStageHandle | null>(null);
   const formatStageRefs = useRef<Record<string, ShaderStageHandle | null>>({});
   const voiceAudioRef = useRef<HTMLAudioElement | null>(null);
@@ -205,6 +231,10 @@ function App() {
   const musicAnalyserRef = useRef<AnalyserNode | null>(null);
   const micAnalyserRef = useRef<AnalyserNode | null>(null);
   const voiceAnalyserRef = useRef<AnalyserNode | null>(null);
+  const musicSpectrumStateRef = useRef<LiveAudioSpectrumState | null>(null);
+  const micSpectrumStateRef = useRef<LiveAudioSpectrumState | null>(null);
+  const voiceSpectrumStateRef = useRef<LiveAudioSpectrumState | null>(null);
+  const audioSmoothnessRef = useRef(normalizeMesh(initialMesh).audioSmoothness);
   const musicAudioContextRef = useRef<AudioContext | null>(null);
   const micAudioContextRef = useRef<AudioContext | null>(null);
   const voiceAudioContextRef = useRef<AudioContext | null>(null);
@@ -218,7 +248,10 @@ function App() {
   const hasLoadedGalleryRef = useRef(false);
   const isSavingGalleryRef = useRef(false);
   const grainMixerRef = useRef(normalizeMesh(initialMesh).grainMixer);
+  const galleryBaseStateRef = useRef<GalleryState>(createDefaultGalleryState());
   const pendingGalleryStateRef = useRef<GalleryState | null>(null);
+  const galleryRevisionRef = useRef<string | null>(null);
+  const galleryStateRef = useRef<GalleryState>(createDefaultGalleryState());
   const skipNextGallerySaveRef = useRef(false);
   const [activeTab, setActiveTab] = useState<ActiveTab>("generate");
   const [activeGallerySectionId, setActiveGallerySectionId] = useState(
@@ -230,6 +263,7 @@ function App() {
   const [blobs, setBlobs] = useState(initialBlobs);
   const [galleryState, setGalleryState] =
     useState<GalleryState>(createDefaultGalleryState);
+  galleryStateRef.current = galleryState;
   const [gallerySaveStatus, setGallerySaveStatus] =
     useState<GallerySaveStatus>("loading");
   const [audioBands, setAudioBands] = useState<number[]>(() => Array(8).fill(0));
@@ -273,12 +307,14 @@ function App() {
     useState<WaveformStyle>(() => getWaveformStyle());
   const [selectedVisualId, setSelectedVisualId] = useState<string | null>(null);
   const [exportFormats, setExportFormats] = useState<Set<string>>(
-    () => new Set([singleFormatOptions[0].label]),
+    () => new Set(allExportFormatLabels),
   );
   const [audioSource, setAudioSource] = useState(sampleAudioPath);
   const [audioFileName, setAudioFileName] = useState("Default MP3");
   const [videoExportProgress, setVideoExportProgress] =
     useState<VideoExportProgress | null>(null);
+  const [videoExportNotice, setVideoExportNotice] =
+    useState<VideoExportNotice | null>(null);
   const [previewZoom, setPreviewZoom] = useState(1);
   const [previewPan, setPreviewPan] = useState({ x: 0, y: 0 });
   const [isPreviewDragging, setIsPreviewDragging] = useState(false);
@@ -289,9 +325,14 @@ function App() {
     startX: number;
     startY: number;
   } | null>(null);
-  const exportCancelRef = useRef(false);
-  const activeExportAudioRef = useRef<HTMLAudioElement | null>(null);
-  const activeExportRecorderRef = useRef<MediaRecorder | null>(null);
+  const videoExportAbortRef = useRef<AbortController | null>(null);
+  const isExportingVideoRef = useRef(false);
+  const videoExportLaunchPendingRef = useRef(false);
+  const audioPreviewSessionRef = useRef(0);
+
+  useEffect(() => {
+    audioSmoothnessRef.current = mesh.audioSmoothness;
+  }, [mesh.audioSmoothness]);
 
   const gallery = galleryState.items;
   const gallerySections = galleryState.sections;
@@ -315,15 +356,23 @@ function App() {
     "--preview-pan-y": `${previewPan.y}px`,
     "--preview-zoom": previewZoom.toFixed(2),
   } as CSSProperties;
+  const previewGridStyle = {
+    "--preview-grid-pan-x": `${previewPan.x * 0.5}px`,
+    "--preview-grid-pan-y": `${previewPan.y * 0.5}px`,
+  } as CSSProperties;
+  const secondaryPreviewFormats = visiblePreviewFormats.filter(
+    (option) => option.label !== primaryPreviewFormat.label,
+  );
+  const previewFormatSplitIndex = Math.ceil(secondaryPreviewFormats.length / 2);
+  const leftPreviewFormats = secondaryPreviewFormats.slice(
+    0,
+    previewFormatSplitIndex,
+  );
+  const rightPreviewFormats = secondaryPreviewFormats.slice(
+    previewFormatSplitIndex,
+  );
   const recordingProgress = videoExportProgress
-    ? Math.max(
-        0,
-        Math.min(
-          1,
-          (videoExportProgress.formatIndex + videoExportProgress.progress) /
-            Math.max(1, videoExportProgress.totalFormats),
-        ),
-      )
+    ? Math.max(0, Math.min(1, videoExportProgress.overallProgress))
     : 0;
   const recordingProgressPercent = Math.round(recordingProgress * 100);
   const recordingProgressStyle = {
@@ -349,14 +398,9 @@ function App() {
   };
 
   const cancelVideoExport = () => {
-    exportCancelRef.current = true;
-    activeExportAudioRef.current?.pause();
-
-    const recorder = activeExportRecorderRef.current;
-
-    if (recorder && recorder.state !== "inactive") {
-      recorder.stop();
-    }
+    videoExportAbortRef.current?.abort(
+      new DOMException("Video export cancelled.", "AbortError"),
+    );
   };
 
   const startPreviewDrag = (event: PointerEvent<HTMLElement>) => {
@@ -412,6 +456,9 @@ function App() {
   };
 
   const clearAudioMeters = () => {
+    musicSpectrumStateRef.current = null;
+    micSpectrumStateRef.current = null;
+    voiceSpectrumStateRef.current = null;
     setAudioBands(Array(8).fill(0));
     setAudioSpectrum(Array(64).fill(0));
     setAudioLevel(0);
@@ -430,6 +477,11 @@ function App() {
   };
 
   const handleAudioFileChange = (event: ChangeEvent<HTMLInputElement>) => {
+    if (isExportingVideo) {
+      event.currentTarget.value = "";
+      return;
+    }
+
     const file = event.currentTarget.files?.[0];
 
     if (!file) {
@@ -478,27 +530,67 @@ function App() {
     });
   };
 
+  const activatePresetPreviewDefaults = useCallback(() => {
+    setFormat(singleFormatOptions[0]);
+    setExportFormats(new Set(allExportFormatLabels));
+    setPreviewPan({ x: 0, y: 0 });
+  }, []);
+
   const flushGallerySaveQueue = async () => {
     if (isSavingGalleryRef.current) {
       return;
     }
 
     isSavingGalleryRef.current = true;
+    let failedGalleryState: GalleryState | null = null;
 
     try {
       while (pendingGalleryStateRef.current) {
         const nextGalleryState = pendingGalleryStateRef.current;
         pendingGalleryStateRef.current = null;
-        await writeGalleryState(nextGalleryState);
+        failedGalleryState = nextGalleryState;
+
+        const savedGallery = await writeGalleryState(
+          nextGalleryState,
+          galleryRevisionRef.current,
+          galleryBaseStateRef.current,
+        );
+        galleryRevisionRef.current = savedGallery.revision;
+        galleryBaseStateRef.current = savedGallery.state;
+        failedGalleryState = null;
+
+        const newerLocalState =
+          pendingGalleryStateRef.current ??
+          (galleryStateRef.current !== nextGalleryState
+            ? galleryStateRef.current
+            : null);
+
+        if (newerLocalState) {
+          const rebasedGalleryState = mergeConcurrentGalleryStates(
+            nextGalleryState,
+            newerLocalState,
+            savedGallery.state,
+          );
+
+          pendingGalleryStateRef.current = rebasedGalleryState;
+          galleryStateRef.current = rebasedGalleryState;
+          skipNextGallerySaveRef.current = true;
+          setGalleryState(rebasedGalleryState);
+        } else if (savedGallery.state !== nextGalleryState) {
+          galleryStateRef.current = savedGallery.state;
+          skipNextGallerySaveRef.current = true;
+          setGalleryState(savedGallery.state);
+        }
       }
 
       setGallerySaveStatus("saved");
     } catch {
+      pendingGalleryStateRef.current ??= failedGalleryState;
       setGallerySaveStatus("error");
     } finally {
       isSavingGalleryRef.current = false;
 
-      if (pendingGalleryStateRef.current) {
+      if (!failedGalleryState && pendingGalleryStateRef.current) {
         void flushGallerySaveQueue();
       }
     }
@@ -514,7 +606,7 @@ function App() {
     const defaultAmbientVisual = findDefaultAmbientVisual(nextGalleryState.items);
 
     setFrameShape("square");
-    setFormat(singleFormatOptions[0]);
+    activatePresetPreviewDefaults();
     setVisualOverlay((currentOverlay) => ({
       ...currentOverlay,
       asset: "waveform",
@@ -530,12 +622,16 @@ function App() {
       return;
     }
 
-    const normalizedMesh = normalizeMesh(defaultAmbientVisual.mesh);
+    const normalizedMesh = applyPresetAudioDefaults(
+      normalizeRenderMesh(defaultAmbientVisual.mesh),
+    );
     setBackgroundColor(defaultAmbientVisual.backgroundColor);
     setBlobs(cloneBlobs(defaultAmbientVisual.blobs));
     grainMixerRef.current = normalizedMesh.grainMixer;
     setMesh(normalizedMesh);
-    setTimelineFrame(normalizedMesh.frame);
+    setTimelineFrame(
+      isPaused ? timelineScrubCenter : clampFrame(normalizedMesh.frame),
+    );
     setPausedFrame(normalizedMesh.frame);
     setFrameOffset(0);
     setSelectedVisualId(defaultAmbientVisual.id);
@@ -588,7 +684,8 @@ function App() {
 
     const loadGalleryState = async () => {
       try {
-        const fileGalleryState = await readGalleryState();
+        const galleryDocument = await readGalleryState();
+        const fileGalleryState = galleryDocument.state;
         const legacyGalleryState = readLegacyGalleryState();
         const nextGalleryState = legacyGalleryState
           ? mergeGalleryStates(fileGalleryState, legacyGalleryState)
@@ -598,6 +695,9 @@ function App() {
           return;
         }
 
+        galleryRevisionRef.current = galleryDocument.revision;
+        galleryBaseStateRef.current = fileGalleryState;
+        galleryStateRef.current = nextGalleryState;
         skipNextGallerySaveRef.current = legacyGalleryState === null;
         setGalleryState(nextGalleryState);
         applyDefaultStartupScene(nextGalleryState);
@@ -615,6 +715,9 @@ function App() {
         }
 
         const fallbackGalleryState = legacyGalleryState ?? createDefaultGalleryState();
+        galleryRevisionRef.current = null;
+        galleryBaseStateRef.current = fallbackGalleryState;
+        galleryStateRef.current = fallbackGalleryState;
         setGalleryState(fallbackGalleryState);
         applyDefaultStartupScene(fallbackGalleryState);
         hasLoadedGalleryRef.current = true;
@@ -644,6 +747,10 @@ function App() {
 
   useEffect(() => {
     return () => {
+      audioPreviewSessionRef.current += 1;
+      videoExportAbortRef.current?.abort(
+        new DOMException("Application closed during video export.", "AbortError"),
+      );
       window.cancelAnimationFrame(musicFrameRef.current);
       window.cancelAnimationFrame(micFrameRef.current);
       window.cancelAnimationFrame(voiceFrameRef.current);
@@ -709,7 +816,7 @@ function App() {
 
     if (property === "frame") {
       const nextFrame = clampFrame(value);
-      setTimelineFrame(nextFrame);
+      setTimelineFrame(isPaused ? timelineScrubCenter : nextFrame);
       setPausedFrame(nextFrame);
       setFrameOffset(0);
       setMesh((currentMesh) => normalizeMesh({ ...currentMesh, frame: nextFrame }));
@@ -725,11 +832,14 @@ function App() {
 
   const randomizeComposition = useCallback(() => {
     const nextFrame = randomBetween(0, meshFrameMax);
-    setTimelineFrame(nextFrame);
+    activatePresetPreviewDefaults();
+    setTimelineFrame(isPaused ? timelineScrubCenter : nextFrame);
     setPausedFrame(nextFrame);
     setFrameOffset(0);
     setMesh((currentMesh) => ({
       ...currentMesh,
+      audioReactivity: presetAudioReactivity,
+      audioSmoothness: presetAudioSmoothness,
       distortion: randomBetween(0.28, 0.86),
       frame: nextFrame,
       grainMixer: grainMixerRef.current,
@@ -745,7 +855,7 @@ function App() {
         name: blob.name,
       })),
     );
-  }, []);
+  }, [activatePresetPreviewDefaults, isPaused]);
 
   const randomizeColors = useCallback(() => {
     setBackgroundColor(randomPaletteColor(activePaletteId));
@@ -761,8 +871,8 @@ function App() {
     setWaveformStyle(createRandomWaveformStyle());
     setMesh((currentMesh) => ({
       ...currentMesh,
-      audioReactivity: randomBetween(14, 48),
-      audioSmoothness: randomBetween(0.4, 5),
+      audioReactivity: presetAudioReactivity,
+      audioSmoothness: presetAudioSmoothness,
       distortion: randomBetween(0.12, 1.15),
       grainMixer: grainMixerRef.current,
       grainOverlay: fixedGrainOverlay,
@@ -822,38 +932,62 @@ function App() {
     waveformRandomizeInterval,
   ]);
 
+  useEffect(() => {
+    if (videoAudioSource !== "none" && isVideoLoopEnabled) {
+      // Arbitrary uploaded/live audio cannot be made sample-perfectly loopable
+      // by fading video alone, so never advertise a false A/V loop.
+      setIsVideoLoopEnabled(false);
+    }
+  }, [isVideoLoopEnabled, videoAudioSource]);
+
   const togglePlayback = () => {
-    const currentMesh = normalizeMesh(stageRef.current?.getCurrentMesh() ?? mesh);
+    const currentMesh = normalizeRenderMesh(
+      stageRef.current?.getCurrentMesh() ?? mesh,
+    );
 
     setMesh(currentMesh);
-    setTimelineFrame(currentMesh.frame);
     setPausedFrame(currentMesh.frame);
     setFrameOffset(0);
-    setIsPaused((currentValue) => !currentValue);
+    setTimelineFrame(
+      isPaused ? clampFrame(currentMesh.frame) : timelineScrubCenter,
+    );
+    setIsPaused(!isPaused);
   };
 
   const scrubTimelineFrame = (nextValue: number) => {
-    const nextFrame = clampFrame(nextValue);
+    const nextTimelineFrame = clampFrame(nextValue);
+    let anchorFrame = pausedFrame;
+    let nextOffset = nextTimelineFrame - timelineScrubCenter;
 
-    if (isPaused) {
-      setFrameOffset(nextFrame - pausedFrame);
-    } else {
-      setPausedFrame(nextFrame);
-      setFrameOffset(0);
+    if (!isPaused) {
+      const currentMesh = normalizeRenderMesh(
+        stageRef.current?.getCurrentMesh() ?? mesh,
+      );
+      anchorFrame = currentMesh.frame;
+      nextOffset = nextTimelineFrame - timelineFrame;
+      setPausedFrame(anchorFrame);
     }
 
+    const nextRenderFrame = anchorFrame + nextOffset;
+    setFrameOffset(nextOffset);
     setIsPaused(true);
-    setTimelineFrame(nextFrame);
+    setTimelineFrame(nextTimelineFrame);
     setMesh((currentMesh) =>
-      normalizeMesh({
+      normalizeRenderMesh({
         ...currentMesh,
-        frame: nextFrame,
+        frame: nextRenderFrame,
       }),
     );
   };
 
   const captureCurrentVisual = () => {
-    const thumbnail = stageRef.current?.captureThumbnail();
+    const currentMesh = applyPresetAudioDefaults(
+      normalizeRenderMesh(stageRef.current?.getCurrentMesh() ?? mesh),
+    );
+    const thumbnail = stageRef.current?.captureThumbnail(
+      undefined,
+      currentMesh.frame,
+    );
 
     if (!thumbnail) {
       return null;
@@ -863,7 +997,7 @@ function App() {
       backgroundColor,
       blobs: cloneBlobs(blobs),
       format: cloneFormat(format),
-      mesh: normalizeMesh(stageRef.current?.getCurrentMesh() ?? mesh),
+      mesh: currentMesh,
       overlay: { ...visualOverlay },
       thumbnail,
     };
@@ -880,6 +1014,7 @@ function App() {
       ...visual,
       id: crypto.randomUUID(),
       name: generateVisualName(),
+      renderVersion: 2,
       sectionId: getExistingSectionId(gallerySections, activeGallerySectionId),
     };
 
@@ -891,6 +1026,22 @@ function App() {
       ),
     }));
     setSelectedVisualId(snapshot.id);
+  };
+
+  const getWaveformPreviewTimestampSeconds = () => {
+    if (voiceStatus === "playing") {
+      return voiceAudioRef.current?.currentTime ?? 0;
+    }
+
+    if (musicStatus === "playing") {
+      return musicAudioRef.current?.currentTime ?? 0;
+    }
+
+    if (micStatus === "listening") {
+      return micAudioContextRef.current?.currentTime ?? 0;
+    }
+
+    return 0;
   };
 
   const getExportTargets = (): ExportTarget[] => {
@@ -912,7 +1063,10 @@ function App() {
     }
 
     const baseName = slugify(generateVisualName());
+    const exportFrame = shaderClock.peek(mesh.frame);
     const exportOverlay = getRenderableOverlay(visualOverlay);
+    const waveformTimestampSeconds =
+      getWaveformPreviewTimestampSeconds();
     await waitForFontsReady();
     const overlayImage = await loadOverlayImage(exportOverlay);
     const qrImage = exportOverlay.showBottomCta && exportOverlay.bottomRight === "qr"
@@ -934,6 +1088,8 @@ function App() {
         qrImage,
         topLogoImage,
         waveformStyle,
+        exportFrame,
+        waveformTimestampSeconds,
       );
 
       if (!dataUrl) {
@@ -948,452 +1104,443 @@ function App() {
   };
 
   const exportVideo = async (videoFormat: VideoExportFormat) => {
-    const targets = getExportTargets();
+    const formatsToExport = singleFormatOptions.filter((option) =>
+      exportFormats.has(option.label),
+    );
 
-    if (targets.length === 0 || typeof MediaRecorder === "undefined") {
-      window.alert("Video export is not supported in this browser.");
+    if (
+      formatsToExport.length === 0 ||
+      isExportingVideo ||
+      isExportingVideoRef.current ||
+      videoExportLaunchPendingRef.current
+    ) {
       return;
     }
 
-    const mimeType = getSupportedVideoMimeType(videoFormat);
+    // Acquire a synchronous mutex before the first await. A double click while
+    // a directory picker or OPFS setup is pending must never launch a second
+    // encoder job that cannot be cancelled through the active controller.
+    videoExportLaunchPendingRef.current = true;
 
-    if (!mimeType) {
-      window.alert(`${videoFormat.toUpperCase()} export is not supported in this browser.`);
+    // This must remain the first awaited operation: browsers only allow the
+    // directory picker while the export button's user activation is alive.
+    let destination: Awaited<
+      ReturnType<typeof prepareVideoOutputDestination>
+    >;
+
+    try {
+      destination = await prepareVideoOutputDestination({
+        fileCount: formatsToExport.length,
+      });
+    } catch (error) {
+      videoExportLaunchPendingRef.current = false;
+      console.error("Could not prepare video output", error);
+      window.alert(getVideoExportErrorMessage(error));
       return;
     }
 
+    if (!destination) {
+      videoExportLaunchPendingRef.current = false;
+      return;
+    }
+
+    videoExportLaunchPendingRef.current = false;
+    isExportingVideoRef.current = true;
+    audioPreviewSessionRef.current += 1;
+    const abortController = new AbortController();
+    const signal = abortController.signal;
     const baseName = slugify(generateVisualName());
     const exportAudioSource = videoAudioSource;
-    const exportDurationSeconds = effectiveVideoDurationSeconds;
+    const currentRenderMesh = stageRef.current?.getCurrentMesh() ?? mesh;
+    const exportMesh = normalizeRenderMesh(currentRenderMesh);
+    const exportBlobs = cloneBlobs(blobs);
+    const exportBackgroundColor = backgroundColor;
+    const exportOverlay = getRenderableOverlay(visualOverlay);
+    const exportWaveformStyle = getWaveformStyle(waveformStyle);
+    const exportOptions: VideoExportOptions = {
+      audioSource: exportAudioSource,
+      bitratePreset: videoBitratePreset,
+      durationSeconds: effectiveVideoDurationSeconds,
+      frameRate: videoFrameRate,
+      isLoopable: isVideoLoopEnabled,
+    };
 
+    videoExportAbortRef.current = abortController;
+    setVideoExportNotice(null);
+    setIsExportingVideo(true);
+    setVideoExportProgress({
+      attempt: 1,
+      completedFormats: 0,
+      formatIndex: 0,
+      formatLabel:
+        exportAudioSource === "microphone" ? "Capturing microphone" : "Preparing",
+      maxAttempts: videoFormatMaxAttempts,
+      overallProgress: 0,
+      progress: 0,
+      totalFormats: formatsToExport.length,
+    });
+
+    // Offline export owns both clocks while it is active. Stop every preview
+    // media/analyser loop up front so a long multi-format job does not compete
+    // with 60 fps React updates and the five preview WebGL contexts. The live
+    // microphone track remains available when it is the selected input.
+    stopMusicPlayback();
+    stopVoicePlayback(true);
+    window.cancelAnimationFrame(micFrameRef.current);
+    micFrameRef.current = 0;
+    clearAudioMeters();
     if (exportAudioSource === "file") {
-      stopVoicePlayback(true);
-      clearAudioMeters();
+      // File preview is intentionally stopped for the long offline job. Clear
+      // its per-job selection so the next click enables and previews it once,
+      // instead of requiring a confusing disable-then-enable double toggle.
+      setVideoAudioSource("none");
     }
 
-    exportCancelRef.current = false;
-    setIsExportingVideo(true);
-    setVideoExportProgress(null);
-    await waitForNextAnimationFrame();
-    const completedExports: Array<{ blob: Blob; filename: string }> = [];
+    const completedVideoFormats: CompletedVideoExportFormat[] = [];
+    const failedVideoFormats: FailedVideoExportFormat[] = [];
 
     try {
-      for (const [formatIndex, target] of targets.entries()) {
-        if (exportCancelRef.current) {
-          break;
+      const [
+        { createAudioAnalysisTimelineAsync },
+        { captureMicrophoneAudioBuffer },
+        { detectOfflineVideoEncoderSupport, encodeOfflineVideo },
+      ] = await Promise.all([
+        import("./export/audioAnalysis"),
+        import("./export/captureMicrophoneAudio"),
+        import("./export/videoEncoder"),
+      ]);
+      throwIfVideoExportAborted(signal);
+
+      let exportAudioBuffer: AudioBuffer | undefined;
+      let resolvedDurationSeconds = exportOptions.durationSeconds;
+
+      if (exportAudioSource === "file") {
+        exportAudioBuffer = await loadAudioBuffer(audioSource, signal);
+        resolvedDurationSeconds = exportAudioBuffer.duration;
+      } else if (exportAudioSource === "microphone") {
+        const micStream = micStreamRef.current;
+
+        if (!micStream) {
+          throw new Error(
+            "Microphone is not active. Start microphone listening before exporting.",
+          );
         }
 
-        setVideoExportProgress({
-          formatIndex,
-          formatLabel: target.format.label,
-          progress: 0,
-          totalFormats: targets.length,
-        });
-        const completedExport = await exportVideoTarget(target, baseName, videoFormat, mimeType, {
-          audioSource: exportAudioSource,
-          bitratePreset: videoBitratePreset,
-          durationSeconds: exportDurationSeconds,
-          frameRate: videoFrameRate,
-          isLoopable: isVideoLoopEnabled,
-        }, (progress) => {
+        exportAudioBuffer = await captureMicrophoneAudioBuffer(
+          micStream,
+          exportOptions.durationSeconds,
+          signal,
+          (progress) => {
+            setVideoExportProgress({
+              attempt: 1,
+              completedFormats: 0,
+              formatIndex: 0,
+              formatLabel: "Capturing microphone",
+              maxAttempts: videoFormatMaxAttempts,
+              overallProgress:
+                Math.max(0, Math.min(1, progress)) *
+                microphoneCaptureProgressWeight,
+              progress: Math.min(0.95, progress),
+              totalFormats: formatsToExport.length,
+            });
+          },
+        );
+        resolvedDurationSeconds = Math.min(
+          exportOptions.durationSeconds,
+          exportAudioBuffer.duration,
+        );
+      }
+
+      throwIfVideoExportAborted(signal);
+      await waitForFontsReady();
+      const [overlayImage, qrImage, topLogoImage] = await Promise.all([
+        loadOverlayImage(exportOverlay),
+        exportOverlay.showBottomCta && exportOverlay.bottomRight === "qr"
+          ? loadQrCodeImage(exportOverlay.tone)
+          : Promise.resolve(null),
+        exportOverlay.showTopLogo
+          ? loadTopLogoImage(exportOverlay)
+          : Promise.resolve(null),
+      ]);
+      throwIfVideoExportAborted(signal);
+
+      const audioAnalysisTimeline = exportAudioBuffer
+        ? await createAudioAnalysisTimelineAsync(
+            exportAudioBuffer,
+            exportOptions.frameRate,
+            {
+              ...getAudioEnvelope(exportMesh.audioSmoothness),
+              durationSeconds: resolvedDurationSeconds,
+              signal,
+              onProgress: (progress) => {
+                const analysisStart =
+                  exportAudioSource === "microphone"
+                    ? microphoneCaptureProgressWeight
+                    : 0;
+                setVideoExportProgress({
+                  attempt: 1,
+                  completedFormats: 0,
+                  formatIndex: 0,
+                  formatLabel: "Analysing audio",
+                  maxAttempts: videoFormatMaxAttempts,
+                  overallProgress:
+                    analysisStart +
+                    Math.max(0, Math.min(1, progress)) *
+                      (videoPreparationProgressWeight - analysisStart),
+                  progress,
+                  totalFormats: formatsToExport.length,
+                });
+              },
+            },
+          )
+        : undefined;
+
+      setVideoExportProgress({
+        attempt: 1,
+        completedFormats: 0,
+        formatIndex: 0,
+        formatLabel: "Checking formats",
+        maxAttempts: videoFormatMaxAttempts,
+        overallProgress: videoPreparationProgressWeight,
+        progress: 0,
+        totalFormats: formatsToExport.length,
+      });
+      await assertVideoExportFormatsSupported({
+        audioBuffer: exportAudioBuffer,
+        bitratePreset: exportOptions.bitratePreset,
+        detectOfflineVideoEncoderSupport,
+        formats: formatsToExport,
+        outputFormat: videoFormat,
+        signal,
+      });
+
+      for (const [formatIndex, formatToExport] of formatsToExport.entries()) {
+        throwIfVideoExportAborted(signal);
+        const filename = `${baseName}-${Math.max(
+          1,
+          Math.round(resolvedDurationSeconds),
+        )}s${exportOptions.isLoopable ? "-loop" : ""}-${formatSlug(
+          formatToExport,
+        )}.${videoFormat}`;
+        let completedFormat = false;
+        let lastFormatError: unknown;
+
+        for (
+          let attemptIndex = 0;
+          attemptIndex < videoFormatMaxAttempts;
+          attemptIndex += 1
+        ) {
+          throwIfVideoExportAborted(signal);
+          const attempt = attemptIndex + 1;
+          const attemptScope = createVideoExportAttemptScope(
+            signal,
+            formatToExport.label,
+          );
+          let outputFile:
+            | import("./export/outputDestination").VideoOutputFile
+            | null = null;
+
           setVideoExportProgress({
+            attempt,
+            completedFormats: completedVideoFormats.length,
             formatIndex,
-            formatLabel: target.format.label,
-            progress,
-            totalFormats: targets.length,
+            formatLabel: formatToExport.label,
+            maxAttempts: videoFormatMaxAttempts,
+            overallProgress: getVideoFormatOverallProgress(
+              formatIndex,
+              0,
+              formatsToExport.length,
+            ),
+            progress: 0,
+            totalFormats: formatsToExport.length,
           });
+
+          try {
+            outputFile = await raceWithAbortSignal(
+              destination.createFile(filename),
+              attemptScope.signal,
+            );
+            attemptScope.heartbeat();
+            const reportTargetProgress = createThrottledProgressReporter(
+              (progress) => {
+                setVideoExportProgress({
+                  attempt,
+                  completedFormats: completedVideoFormats.length,
+                  formatIndex,
+                  formatLabel: formatToExport.label,
+                  maxAttempts: videoFormatMaxAttempts,
+                  overallProgress: getVideoFormatOverallProgress(
+                    formatIndex,
+                    progress,
+                    formatsToExport.length,
+                  ),
+                  progress,
+                  totalFormats: formatsToExport.length,
+                });
+              },
+            );
+            const completedFile = await raceWithAbortSignal(
+              renderAndEncodeVideoTarget({
+                audioAnalysisTimeline,
+                audioBuffer: exportAudioBuffer,
+                backgroundColor: exportBackgroundColor,
+                bitrate: getCompressedVideoBitrate(
+                  formatToExport,
+                  exportOptions.bitratePreset,
+                ),
+                blobs: exportBlobs,
+                durationSeconds: resolvedDurationSeconds,
+                encodeOfflineVideo,
+                format: formatToExport,
+                frameRate: exportOptions.frameRate,
+                hardwareAcceleration:
+                  attemptIndex === 0
+                    ? "no-preference"
+                    : "prefer-software",
+                isLoopable: exportOptions.isLoopable,
+                mesh: exportMesh,
+                onProgress: (progress) => {
+                  attemptScope.heartbeat();
+                  reportTargetProgress(progress);
+                },
+                outputFile,
+                outputFormat: videoFormat,
+                overlay: exportOverlay,
+                overlayImage,
+                qrImage,
+                signal: attemptScope.signal,
+                topLogoImage,
+                waveformStyle: exportWaveformStyle,
+              }),
+              attemptScope.signal,
+            );
+
+            completedVideoFormats.push({
+              filename: completedFile.filename,
+              formatLabel: formatToExport.label,
+              sizeBytes: completedFile.sizeBytes,
+            });
+            completedFormat = true;
+            setVideoExportProgress({
+              attempt,
+              completedFormats: completedVideoFormats.length,
+              formatIndex,
+              formatLabel: formatToExport.label,
+              maxAttempts: videoFormatMaxAttempts,
+              overallProgress: getVideoFormatOverallProgress(
+                formatIndex,
+                1,
+                formatsToExport.length,
+              ),
+              progress: 1,
+              totalFormats: formatsToExport.length,
+            });
+            break;
+          } catch (error) {
+            lastFormatError = error;
+            await outputFile?.discard().catch((discardError) => {
+              console.warn(
+                `Could not clean up failed ${formatToExport.label} export.`,
+                discardError,
+              );
+            });
+
+            if (signal.aborted) {
+              throw signal.reason ?? error;
+            }
+
+            console.error(
+              `Video export attempt ${attempt}/${videoFormatMaxAttempts} failed for ${formatToExport.label}.`,
+              error,
+            );
+
+            if (isFatalVideoOutputError(error)) {
+              throw error;
+            }
+
+            if (attempt < videoFormatMaxAttempts) {
+              await waitForVideoEncoderRecovery(signal);
+            }
+          } finally {
+            attemptScope.dispose();
+          }
+        }
+
+        if (!completedFormat) {
+          failedVideoFormats.push({
+            formatLabel: formatToExport.label,
+            reason: getErrorMessage(lastFormatError),
+          });
+        }
+
+        if (formatIndex + 1 < formatsToExport.length) {
+          await waitForVideoEncoderRecovery(signal);
+        }
+      }
+
+      const batchNotice = createVideoExportBatchNotice(
+        completedVideoFormats,
+        failedVideoFormats,
+        formatsToExport.length,
+      );
+      setVideoExportNotice(batchNotice);
+
+      if (batchNotice.kind === "error") {
+        window.alert(batchNotice.message);
+      }
+    } catch (error) {
+      if (isAbortError(error) || signal.aborted) {
+        setVideoExportNotice({
+          kind: "error",
+          message: `Video export cancelled after ${completedVideoFormats.length}/${formatsToExport.length} formats were saved.`,
         });
-
-        if (completedExport) {
-          completedExports.push(completedExport);
-        }
-      }
-
-      if (!exportCancelRef.current && completedExports.length > 0) {
-        if (completedExports.length === 1) {
-          const [{ blob, filename }] = completedExports;
-          downloadBlob(blob, filename);
-        } else {
-          const archive = await createZipBlob(completedExports);
-          downloadBlob(archive, `${baseName}-${videoFormat}-formats.zip`);
-        }
-      }
-    } catch {
-      if (!exportCancelRef.current) {
-        window.alert("Video export failed.");
+      } else {
+        console.error("Video export failed", error);
+        const message = `${getVideoExportErrorMessage(error)} Saved ${completedVideoFormats.length}/${formatsToExport.length} formats before the failure.`;
+        setVideoExportNotice({ kind: "error", message });
+        window.alert(message);
       }
     } finally {
+      if (videoExportAbortRef.current === abortController) {
+        videoExportAbortRef.current = null;
+      }
+      videoExportLaunchPendingRef.current = false;
+      isExportingVideoRef.current = false;
+      clearAudioMeters();
       setIsExportingVideo(false);
       setVideoExportProgress(null);
-      exportCancelRef.current = false;
-      activeExportAudioRef.current = null;
-      activeExportRecorderRef.current = null;
-    }
-  };
 
-  const exportVideoTarget = async (
-    target: ExportTarget,
-    baseName: string,
-    videoFormat: VideoExportFormat,
-    mimeType: string,
-    options: VideoExportOptions,
-    onProgress: (progress: number) => void,
-  ) => {
-    const canvas = target.handle.getCanvas();
+      if (
+        exportAudioSource === "microphone"
+      ) {
+        const hasLiveMicrophoneTrack = micStreamRef.current
+          ?.getAudioTracks()
+          .some((track) => track.readyState === "live");
 
-    if (!canvas) {
-      throw new Error("Video export is not supported in this browser.");
-    }
-
-    const recordingOverlay = getRenderableOverlay(visualOverlay);
-    await waitForFontsReady();
-    const overlayImage = await loadOverlayImage(recordingOverlay);
-    const qrImage = recordingOverlay.showBottomCta && recordingOverlay.bottomRight === "qr"
-      ? await loadQrCodeImage(recordingOverlay.tone)
-      : null;
-    const topLogoImage = recordingOverlay.showTopLogo ? await loadTopLogoImage(recordingOverlay) : null;
-    const captureCanvas = document.createElement("canvas");
-    captureCanvas.width = target.format.exportWidth ?? canvas.width;
-    captureCanvas.height = target.format.exportHeight ?? canvas.height;
-
-    const captureContext = captureCanvas.getContext("2d");
-
-    if (!captureContext || typeof captureCanvas.captureStream !== "function") {
-      throw new Error("Video export is not supported in this browser.");
-    }
-
-    let exportAudio: HTMLAudioElement | null = null;
-    let exportAudioContext: AudioContext | null = null;
-    let exportAnalyser: AnalyserNode | null = null;
-    let exportAudioTracks: MediaStreamTrack[] = [];
-    let exportAudioDelayMs = 0;
-    let resolvedDurationSeconds = options.durationSeconds;
-
-    if (options.audioSource === "file") {
-      const selectedAudio = new Audio();
-      exportAudio = selectedAudio;
-      activeExportAudioRef.current = selectedAudio;
-      setAudioElementSource(selectedAudio, audioSource);
-      selectedAudio.preload = "auto";
-      selectedAudio.currentTime = 0;
-
-      await new Promise<void>((resolve) => {
-        const finishLoading = () => {
-          selectedAudio.removeEventListener("loadedmetadata", onReady);
-          selectedAudio.removeEventListener("error", finishLoading);
-          resolve();
-        };
-        const onReady = () => finishLoading();
-        if (Number.isFinite(selectedAudio.duration) && selectedAudio.duration > 0) {
-          resolve();
+        if (hasLiveMicrophoneTrack && micAnalyserRef.current) {
+          updateMicLevel();
         } else {
-          selectedAudio.addEventListener("loadedmetadata", onReady);
-          selectedAudio.addEventListener("error", finishLoading);
-          selectedAudio.load();
+          stopMicrophone();
+          clearAudioMeters();
         }
-      });
-
-      if (Number.isFinite(selectedAudio.duration) && selectedAudio.duration > 0) {
-        resolvedDurationSeconds = selectedAudio.duration;
-      }
-
-      if (exportCancelRef.current) {
-        selectedAudio.pause();
-        if (activeExportAudioRef.current === selectedAudio) {
-          activeExportAudioRef.current = null;
-        }
-        return;
-      }
-
-      exportAudioContext = new AudioContext();
-      exportAnalyser = exportAudioContext.createAnalyser();
-      exportAnalyser.fftSize = 256;
-      exportAnalyser.smoothingTimeConstant = 0.48;
-      const exportSource = exportAudioContext.createMediaElementSource(selectedAudio);
-      const exportAudioDelay = exportAudioContext.createDelay(
-        exportAudioLookaheadSeconds + 0.05,
-      );
-      const monoDestination = exportAudioContext.createMediaStreamDestination();
-      const monoSplitter = exportAudioContext.createChannelSplitter(2);
-      const monoLeftGain = exportAudioContext.createGain();
-      const monoRightGain = exportAudioContext.createGain();
-      const monoMerger = exportAudioContext.createChannelMerger(1);
-      exportAudioDelay.delayTime.value = exportAudioLookaheadSeconds;
-      monoDestination.channelCount = 1;
-      monoDestination.channelCountMode = "explicit";
-      monoLeftGain.gain.value = 0.5;
-      monoRightGain.gain.value = 0.5;
-      exportSource.connect(exportAnalyser);
-      exportSource.connect(exportAudioDelay);
-      exportAudioDelay.connect(monoSplitter);
-      monoSplitter.connect(monoLeftGain, 0);
-      monoSplitter.connect(monoRightGain, 1);
-      monoLeftGain.connect(monoMerger, 0, 0);
-      monoRightGain.connect(monoMerger, 0, 0);
-      monoMerger.connect(monoDestination);
-      exportAudioTracks = monoDestination.stream.getAudioTracks();
-      exportAudioDelayMs = Math.round(exportAudioLookaheadSeconds * 1000);
-    } else if (options.audioSource === "microphone") {
-      const microphoneTrack = micStreamRef.current
-        ?.getAudioTracks()
-        .find((track) => track.readyState === "live");
-
-      if (microphoneTrack) {
-        exportAudioTracks = [microphoneTrack.clone()];
-        exportAnalyser = micAnalyserRef.current;
-      }
-    }
-
-    const durationMs = Math.max(1000, Math.round(resolvedDurationSeconds * 1000));
-
-    if (exportCancelRef.current) {
-      return;
-    }
-
-    const exportLevels = new Uint8Array(exportAnalyser?.frequencyBinCount ?? 128);
-    let exportMeshSpectrum = Array(64).fill(0);
-    let exportWaveformSpectrum = Array(64).fill(0);
-    let exportBands = Array(8).fill(0);
-    let exportLevel = 0;
-    let loopStartCanvas: HTMLCanvasElement | null = null;
-    let startedAt = 0;
-    let lastDrawAt = 0;
-    let lastReportedProgress = -1;
-    let drawFrameId = 0;
-    let stopTimeoutId = 0;
-    let fallbackStopTimeoutId = 0;
-    let hasRequestedRecorderStop = false;
-    let hasScheduledRecorderStop = false;
-    let recorder: MediaRecorder;
-    const stopRecorder = () => {
-      hasRequestedRecorderStop = true;
-      if (recorder.state !== "inactive") {
-        recorder.stop();
-      }
-    };
-    const scheduleStopRecorder = (delayMs = 0) => {
-      if (hasScheduledRecorderStop || hasRequestedRecorderStop) {
-        return;
-      }
-
-      hasScheduledRecorderStop = true;
-      stopTimeoutId = window.setTimeout(stopRecorder, delayMs);
-    };
-
-    const drawCompositedFrame = (
-      context: CanvasRenderingContext2D,
-      deltaMs = 0,
-    ) => {
-      let nextSpectrum = Array(64).fill(0);
-
-      if (exportAnalyser) {
-        exportAnalyser.getByteFrequencyData(exportLevels);
-        nextSpectrum = sampleSpectrumLevels(
-          exportLevels,
-          exportAnalyser.context.sampleRate,
-          64,
-          1000,
-          16000,
-        );
-      }
-      exportMeshSpectrum = exportMeshSpectrum.map((currentBand, index) =>
-        currentBand * 0.68 + (nextSpectrum[index] ?? 0) * 0.32,
-      );
-      exportWaveformSpectrum = exportWaveformSpectrum.map((currentBand, index) => {
-        const leftBand = nextSpectrum[Math.max(0, index - 1)] ?? 0;
-        const centerBand = nextSpectrum[index] ?? 0;
-        const rightBand = nextSpectrum[Math.min(nextSpectrum.length - 1, index + 1)] ?? 0;
-        const nextBand = leftBand * 0.22 + centerBand * 0.56 + rightBand * 0.22;
-        const smoothing = nextBand > currentBand ? 0.52 : 0.16;
-
-        return currentBand + (nextBand - currentBand) * smoothing;
-      });
-      const nextBands = spectrumToBands(exportMeshSpectrum);
-      const nextLevel = spectrumToLevel(exportMeshSpectrum);
-      exportBands = exportBands.map((currentBand, index) =>
-        currentBand * 0.68 + (nextBands[index] ?? 0) * 0.32,
-      );
-      exportLevel = exportLevel * 0.72 + nextLevel * 0.28;
-      target.handle.renderExportFrame(exportBands, exportLevel, deltaMs);
-
-      context.clearRect(0, 0, context.canvas.width, context.canvas.height);
-      context.drawImage(canvas, 0, 0, context.canvas.width, context.canvas.height);
-
-      const drewVisibleOverlay = drawVisiblePreviewOverlay(
-        context,
-        target.format.label,
-        exportWaveformSpectrum,
-        recordingOverlay,
-        topLogoImage,
-        waveformStyle,
-      );
-
-      if (!drewVisibleOverlay) {
-        drawOverlay(context, context.canvas.width, context.canvas.height, {
-          audioLevel: spectrumToLevel(exportWaveformSpectrum),
-          audioSpectrum: exportWaveformSpectrum,
-          image: overlayImage,
-          qrImage,
-          topLogoImage,
-          overlay: recordingOverlay,
-          waveformStyle,
-        });
-      }
-    };
-
-    if (options.isLoopable) {
-      loopStartCanvas = document.createElement("canvas");
-      loopStartCanvas.width = captureCanvas.width;
-      loopStartCanvas.height = captureCanvas.height;
-
-      const loopStartContext = loopStartCanvas.getContext("2d");
-
-      if (!loopStartContext) {
-        throw new Error("Video export failed.");
-      }
-
-      drawCompositedFrame(loopStartContext);
-    }
-
-    const drawFrame = () => {
-      const now = performance.now();
-      const elapsedMs = startedAt > 0 ? Math.min(durationMs, now - startedAt) : 0;
-      const deltaMs = lastDrawAt > 0 ? now - lastDrawAt : 0;
-      lastDrawAt = now;
-      const nextProgress = Math.max(0, Math.min(1, elapsedMs / durationMs));
-
-      if (elapsedMs >= durationMs) {
-        scheduleStopRecorder(exportAudioDelayMs);
-      }
-
-      if (nextProgress - lastReportedProgress >= 0.01 || nextProgress >= 1) {
-        lastReportedProgress = nextProgress;
-        onProgress(nextProgress);
-      }
-
-      drawCompositedFrame(captureContext, deltaMs);
-
-      if (loopStartCanvas) {
-        const loopFade =
-          startedAt > 0 ? getLoopFadeAmount(now - startedAt, durationMs) : 0;
-
-        if (loopFade > 0) {
-          captureContext.save();
-          captureContext.globalAlpha = loopFade;
-          captureContext.drawImage(loopStartCanvas, 0, 0);
-          captureContext.restore();
-        }
-      }
-
-      drawFrameId = window.requestAnimationFrame(drawFrame);
-    };
-
-    drawCompositedFrame(captureContext);
-
-    const videoStream = captureCanvas.captureStream(options.frameRate);
-    const mixStream = new MediaStream(videoStream.getVideoTracks());
-    exportAudioTracks.forEach((track) => {
-      mixStream.addTrack(track);
-    });
-    const chunks: BlobPart[] = [];
-
-    try {
-      recorder = new MediaRecorder(mixStream, {
-        ...(mimeType ? { mimeType } : {}),
-        ...(exportAudioTracks.length > 0
-          ? { audioBitsPerSecond: exportAudioBitsPerSecond }
-          : {}),
-        videoBitsPerSecond: getCompressedVideoBitrate(target.format, options.bitratePreset),
-      });
-      activeExportRecorderRef.current = recorder;
-    } catch (error) {
-      videoStream.getTracks().forEach((track) => track.stop());
-      mixStream.getTracks().forEach((track) => track.stop());
-      window.cancelAnimationFrame(drawFrameId);
-      throw error;
-    }
-
-    try {
-      const blob = await new Promise<Blob>((resolve, reject) => {
-        recorder.ondataavailable = (event) => {
-          if (event.data.size > 0) {
-            chunks.push(event.data);
-          }
-        };
-        recorder.onerror = () => {
-          reject(new Error("Video export failed."));
-        };
-        recorder.onstop = () => {
-          onProgress(1);
-          resolve(
-            new Blob(chunks, {
-              type: recorder.mimeType || mimeType,
-            }),
-          );
-        };
-
-        recorder.start();
-        startedAt = performance.now();
-        lastDrawAt = startedAt;
-        onProgress(0);
-        drawFrame();
-        if (exportAudioContext && exportAudio) {
-          void exportAudioContext.resume().catch(() => {});
-          void exportAudio.play().catch(() => {
-            // Keep recording even if the selected audio file cannot start.
-          });
-        }
-        fallbackStopTimeoutId = window.setTimeout(
-          () => scheduleStopRecorder(0),
-          durationMs + exportAudioDelayMs + 250,
-        );
-      });
-
-      if (exportCancelRef.current) {
-        return null;
-      }
-
-      return {
-        blob,
-        filename: `${baseName}-${formatSlug(target.format)}-${Math.max(1, Math.round(durationMs / 1000))}s${
-          options.isLoopable ? "-loop" : ""
-        }.${videoFormat}`,
-      };
-    } finally {
-      window.clearTimeout(stopTimeoutId);
-      window.clearTimeout(fallbackStopTimeoutId);
-      window.cancelAnimationFrame(drawFrameId);
-      exportAudio?.pause();
-      if (exportAudio) {
-        exportAudio.currentTime = 0;
-      }
-      clearAudioMeters();
-      if (exportAudioContext) {
-        void exportAudioContext.close();
-      }
-      videoStream.getTracks().forEach((track) => track.stop());
-      mixStream.getTracks().forEach((track) => track.stop());
-      if (exportAudio && activeExportAudioRef.current === exportAudio) {
-        activeExportAudioRef.current = null;
-      }
-      if (activeExportRecorderRef.current === recorder) {
-        activeExportRecorderRef.current = null;
       }
     }
   };
 
   const loadVisual = (visual: VisualSnapshot) => {
-    const nextMesh = normalizeMesh(visual.mesh);
+    const nextMesh = applyPresetAudioDefaults(normalizeRenderMesh(visual.mesh));
 
+    activatePresetPreviewDefaults();
     setBackgroundColor(visual.backgroundColor);
     setBlobs(cloneBlobs(visual.blobs));
     grainMixerRef.current = nextMesh.grainMixer;
     setMesh(nextMesh);
     setVisualOverlay(normalizeOverlay(visual.overlay));
-    setTimelineFrame(nextMesh.frame);
+    setTimelineFrame(
+      isPaused ? timelineScrubCenter : clampFrame(nextMesh.frame),
+    );
     setPausedFrame(nextMesh.frame);
     setFrameOffset(0);
-    setFormat(getFormatOption(visual.format.label));
     setSelectedVisualId(visual.id);
   };
 
@@ -1456,83 +1603,83 @@ function App() {
 
   const updateAudioLevel = (
     analyser: AnalyserNode | null,
+    spectrumStateRef: { current: LiveAudioSpectrumState | null },
     frameRef: typeof musicFrameRef,
-    updateFrame: () => void,
+    updateFrame: FrameRequestCallback,
+    timestampMs: number,
   ) => {
     if (!analyser) {
-      setAudioBands(Array(8).fill(0));
-      setAudioSpectrum(Array(64).fill(0));
-      setAudioLevel(0);
+      clearAudioMeters();
       return;
     }
 
-    const levels = new Uint8Array(analyser.frequencyBinCount);
-    analyser.getByteFrequencyData(levels);
-
-    const nextSpectrum = sampleSpectrumLevels(
-      levels,
-      analyser.context.sampleRate,
-      64,
-      1000,
-      16000,
+    spectrumStateRef.current ??= createLiveAudioSpectrumState(analyser);
+    const nextSpectrum = updateLiveAudioSpectrum(
+      analyser,
+      spectrumStateRef.current,
+      audioSmoothnessRef.current,
+      timestampMs,
     );
-    const nextBands = Array.from({ length: 8 }, (_, bandIndex) => {
-      const start = Math.floor((bandIndex / 8) * nextSpectrum.length);
-      const end = Math.max(
-        start + 1,
-        Math.floor(((bandIndex + 1) / 8) * nextSpectrum.length),
-      );
-      let total = 0;
+    const nextBands = new Float32Array(8);
+    writeSpectrumBands(nextSpectrum, nextBands);
 
-      for (let index = start; index < end; index++) {
-        total += nextSpectrum[index] ?? 0;
-      }
-
-      return Math.max(0, Math.min(1, total / (end - start)));
-    });
-    const nextLevel = Math.max(
-      0,
-      Math.min(
-        1,
-        nextSpectrum.reduce((sum, value) => sum + value, 0) /
-          Math.max(1, nextSpectrum.length),
-      ),
-    );
-
-    setAudioBands((currentBands) =>
-      currentBands.map((currentBand, index) =>
-        currentBand * 0.68 + nextBands[index] * 0.32,
-      ),
-    );
-    setAudioSpectrum((currentSpectrum) =>
-      currentSpectrum.map((currentBand, index) =>
-        currentBand * 0.5 + nextSpectrum[index] * 0.5,
-      ),
-    );
-    setAudioLevel((currentLevel) => currentLevel * 0.72 + nextLevel * 0.28);
+    // The canonical analyser has already applied the same attack/release
+    // envelope used by offline export. React receives snapshots only; neither
+    // the UI nor ShaderRenderer applies a second, divergent EMA.
+    setAudioBands(Array.from(nextBands));
+    setAudioSpectrum(Array.from(nextSpectrum));
+    setAudioLevel(getSpectrumLevel(nextSpectrum));
     frameRef.current = window.requestAnimationFrame(updateFrame);
   };
 
-  const updateMusicLevel = () => {
-    updateAudioLevel(musicAnalyserRef.current, musicFrameRef, updateMusicLevel);
+  const updateMusicLevel = (timestampMs = performance.now()) => {
+    updateAudioLevel(
+      musicAnalyserRef.current,
+      musicSpectrumStateRef,
+      musicFrameRef,
+      updateMusicLevel,
+      timestampMs,
+    );
   };
 
-  const updateMicLevel = () => {
-    updateAudioLevel(micAnalyserRef.current, micFrameRef, updateMicLevel);
+  const updateMicLevel = (timestampMs = performance.now()) => {
+    updateAudioLevel(
+      micAnalyserRef.current,
+      micSpectrumStateRef,
+      micFrameRef,
+      updateMicLevel,
+      timestampMs,
+    );
   };
 
-  const updateVoiceLevel = () => {
-    updateAudioLevel(voiceAnalyserRef.current, voiceFrameRef, updateVoiceLevel);
+  const updateVoiceLevel = (timestampMs = performance.now()) => {
+    updateAudioLevel(
+      voiceAnalyserRef.current,
+      voiceSpectrumStateRef,
+      voiceFrameRef,
+      updateVoiceLevel,
+      timestampMs,
+    );
   };
+
+  const isCurrentAudioPreviewSession = (session: number) =>
+    session === audioPreviewSessionRef.current &&
+    !isExportingVideoRef.current;
 
   const stopMusicPlayback = () => {
+    audioPreviewSessionRef.current += 1;
     musicAudioRef.current?.pause();
     window.cancelAnimationFrame(musicFrameRef.current);
+    musicFrameRef.current = 0;
+    musicSpectrumStateRef.current = null;
     setMusicStatus("idle");
   };
 
   const stopMicrophone = (preserveVideoAudioSource = false) => {
+    audioPreviewSessionRef.current += 1;
     window.cancelAnimationFrame(micFrameRef.current);
+    micFrameRef.current = 0;
+    micSpectrumStateRef.current = null;
     micStreamRef.current?.getTracks().forEach((track) => track.stop());
     micSourceRef.current?.disconnect();
     micAnalyserRef.current?.disconnect();
@@ -1550,8 +1697,11 @@ function App() {
   };
 
   const stopVoicePlayback = (preserveVideoAudioSource = false) => {
+    audioPreviewSessionRef.current += 1;
     voiceAudioRef.current?.pause();
     window.cancelAnimationFrame(voiceFrameRef.current);
+    voiceFrameRef.current = 0;
+    voiceSpectrumStateRef.current = null;
     setVoiceStatus("idle");
     if (!preserveVideoAudioSource) {
       setVideoAudioSource((currentSource) =>
@@ -1561,6 +1711,13 @@ function App() {
   };
 
   const toggleMusic = async () => {
+    if (
+      isExportingVideoRef.current ||
+      videoExportLaunchPendingRef.current
+    ) {
+      return;
+    }
+
     if (musicStatus === "playing") {
       stopMusicPlayback();
       setAudioBands(Array(8).fill(0));
@@ -1571,6 +1728,7 @@ function App() {
 
     stopVoicePlayback();
     stopMicrophone();
+    const previewSession = ++audioPreviewSessionRef.current;
     setMusicStatus("loading");
 
     try {
@@ -1588,8 +1746,7 @@ function App() {
       if (!musicSourceRef.current) {
         const source = audioContext.createMediaElementSource(audio);
         const analyser = audioContext.createAnalyser();
-        analyser.fftSize = 256;
-        analyser.smoothingTimeConstant = 0.78;
+        configureLiveAudioAnalyser(analyser);
         source.connect(analyser);
         connectMonoOutput(audioContext, analyser);
         musicSourceRef.current = source;
@@ -1600,10 +1757,25 @@ function App() {
         await audioContext.resume();
       }
 
+      if (!isCurrentAudioPreviewSession(previewSession)) {
+        audio.pause();
+        return;
+      }
+
       await audio.play();
+
+      if (!isCurrentAudioPreviewSession(previewSession)) {
+        audio.pause();
+        return;
+      }
+
       setMusicStatus("playing");
       updateMusicLevel();
     } catch {
+      if (!isCurrentAudioPreviewSession(previewSession)) {
+        return;
+      }
+
       setMusicStatus("idle");
       setAudioBands(Array(8).fill(0));
       setAudioSpectrum(Array(64).fill(0));
@@ -1613,6 +1785,13 @@ function App() {
   };
 
   const toggleMicrophone = async () => {
+    if (
+      isExportingVideoRef.current ||
+      videoExportLaunchPendingRef.current
+    ) {
+      return;
+    }
+
     if (videoAudioSource === "microphone" || micStatus === "listening") {
       stopMicrophone();
       setAudioBands(Array(8).fill(0));
@@ -1629,6 +1808,7 @@ function App() {
 
     stopMusicPlayback();
     stopVoicePlayback();
+    const previewSession = ++audioPreviewSessionRef.current;
     setMicStatus("loading");
     setVoiceNotice("");
 
@@ -1640,8 +1820,18 @@ function App() {
           noiseSuppression: true,
         },
       });
+
+      if (!isCurrentAudioPreviewSession(previewSession)) {
+        stream.getTracks().forEach((track) => track.stop());
+        return;
+      }
+
       stream.getAudioTracks().forEach((track) => {
         track.onended = () => {
+          if (micStreamRef.current !== stream) {
+            return;
+          }
+
           stopMicrophone();
           setAudioBands(Array(8).fill(0));
           setAudioSpectrum(Array(64).fill(0));
@@ -1651,8 +1841,7 @@ function App() {
       const audioContext = new AudioContext();
       const source = audioContext.createMediaStreamSource(stream);
       const analyser = audioContext.createAnalyser();
-      analyser.fftSize = 256;
-      analyser.smoothingTimeConstant = 0.82;
+      configureLiveAudioAnalyser(analyser);
       source.connect(analyser);
 
       micStreamRef.current = stream;
@@ -1664,10 +1853,29 @@ function App() {
         await audioContext.resume();
       }
 
+      if (!isCurrentAudioPreviewSession(previewSession)) {
+        stream.getTracks().forEach((track) => track.stop());
+        source.disconnect();
+        analyser.disconnect();
+        await audioContext.close().catch(() => undefined);
+
+        if (micStreamRef.current === stream) {
+          micStreamRef.current = null;
+          micSourceRef.current = null;
+          micAnalyserRef.current = null;
+          micAudioContextRef.current = null;
+        }
+        return;
+      }
+
       setVideoAudioSource("microphone");
       setMicStatus("listening");
       updateMicLevel();
     } catch (error) {
+      if (!isCurrentAudioPreviewSession(previewSession)) {
+        return;
+      }
+
       stopMicrophone();
       setAudioBands(Array(8).fill(0));
       setAudioSpectrum(Array(64).fill(0));
@@ -1681,6 +1889,13 @@ function App() {
   };
 
   const playVoiceLine = async () => {
+    if (
+      isExportingVideoRef.current ||
+      videoExportLaunchPendingRef.current
+    ) {
+      return;
+    }
+
     if (videoAudioSource === "file" || voiceStatus !== "idle") {
       stopVoicePlayback();
       setAudioBands(Array(8).fill(0));
@@ -1692,6 +1907,7 @@ function App() {
 
     stopMusicPlayback();
     stopMicrophone();
+    const previewSession = ++audioPreviewSessionRef.current;
     setVoiceStatus("loading");
     setVoiceNotice("");
 
@@ -1711,8 +1927,7 @@ function App() {
       if (!voiceSourceRef.current) {
         const source = audioContext.createMediaElementSource(audio);
         const analyser = audioContext.createAnalyser();
-        analyser.fftSize = 256;
-        analyser.smoothingTimeConstant = 0.78;
+        configureLiveAudioAnalyser(analyser);
         source.connect(analyser);
         connectMonoOutput(audioContext, analyser);
         voiceSourceRef.current = source;
@@ -1723,7 +1938,16 @@ function App() {
         await audioContext.resume();
       }
 
+      if (!isCurrentAudioPreviewSession(previewSession)) {
+        audio.pause();
+        return;
+      }
+
       audio.onended = () => {
+        if (!isCurrentAudioPreviewSession(previewSession)) {
+          return;
+        }
+
         window.cancelAnimationFrame(voiceFrameRef.current);
         setVoiceStatus("idle");
         setAudioBands(Array(8).fill(0));
@@ -1731,6 +1955,10 @@ function App() {
         setAudioLevel(0);
       };
       audio.onerror = () => {
+        if (!isCurrentAudioPreviewSession(previewSession)) {
+          return;
+        }
+
         window.cancelAnimationFrame(voiceFrameRef.current);
         setVoiceStatus("idle");
         setVideoAudioSource("none");
@@ -1741,10 +1969,20 @@ function App() {
       };
 
       await audio.play();
+
+      if (!isCurrentAudioPreviewSession(previewSession)) {
+        audio.pause();
+        return;
+      }
+
       setVideoAudioSource("file");
       setVoiceStatus("playing");
       updateVoiceLevel();
     } catch (error) {
+      if (!isCurrentAudioPreviewSession(previewSession)) {
+        return;
+      }
+
       setVoiceStatus("idle");
       setVideoAudioSource("none");
       setAudioBands(Array(8).fill(0));
@@ -1758,8 +1996,92 @@ function App() {
     }
   };
 
+  const waveformPreviewTimestampSeconds =
+    getWaveformPreviewTimestampSeconds();
+
+  const renderPreviewFormat = (previewFormat: SingleFormatOption) => {
+    const formatProgress =
+      videoExportProgress?.formatLabel === previewFormat.label
+        ? videoExportProgress.progress
+        : 0;
+    const isRecordingFormat =
+      isExportingVideo && videoExportProgress?.formatLabel === previewFormat.label;
+
+    return (
+      <div className="format-overview-item" key={previewFormat.label}>
+        <span>{previewFormat.label}</span>
+        <div
+          data-format-label={previewFormat.label}
+          className={cn(
+            "format-frame",
+            getPreviewFrameClass(previewFormat.label),
+          )}
+          style={
+            {
+              ...frameAudioStyle,
+              "--format-ratio": `${previewFormat.width / previewFormat.height}`,
+              "--scene-horizontal-padding": `${
+                (getSceneHorizontalPadding(previewFormat.exportWidth) /
+                  previewFormat.exportWidth) *
+                100
+              }cqw`,
+              aspectRatio: `${previewFormat.width} / ${previewFormat.height}`,
+            } as CSSProperties
+          }
+        >
+          <ShaderStage
+            audioBands={audioBands}
+            audioLevel={audioLevel}
+            clock={shaderClock}
+            ref={(handle) => {
+              formatStageRefs.current[previewFormat.label] = handle;
+
+              if (previewFormat.label === primaryPreviewFormat.label) {
+                stageRef.current = handle;
+              }
+            }}
+            backgroundColor={backgroundColor}
+            blobs={blobs}
+            isPaused={isPaused || isExportingVideo}
+            mesh={mesh}
+          />
+          <VisualOverlayMark
+            audioSpectrum={audioSpectrum}
+            audioLevel={audioLevel}
+            format={previewFormat}
+            frameShape={frameShape}
+            overlay={visualOverlay}
+            waveformStyle={waveformStyle}
+            waveformTimestampSeconds={waveformPreviewTimestampSeconds}
+          />
+          <SceneDecorations overlay={visualOverlay} />
+        </div>
+        <div
+          aria-hidden={!isRecordingFormat}
+          aria-label={
+            isRecordingFormat
+              ? `${previewFormat.label} exporting ${Math.round(formatProgress * 100)}%`
+              : undefined
+          }
+          className={cn(
+            "format-export-progress",
+            !isRecordingFormat && "format-export-progress-hidden",
+          )}
+          style={{ "--format-progress": formatProgress.toFixed(4) } as CSSProperties}
+        >
+          <span className="format-export-progress-track">
+            <span className="format-export-progress-fill" />
+          </span>
+          <span className="format-export-progress-label">
+            {Math.round(formatProgress * 100)}%
+          </span>
+        </div>
+      </div>
+    );
+  };
+
   return (
-    <main className="app-shell" data-theme={uiTheme}>
+    <main className="app-shell" data-theme={uiTheme} style={previewGridStyle}>
       <header className="app-header">
         <div className="app-brand">
           <img
@@ -1782,6 +2104,8 @@ function App() {
       <section
         className="control-panel relative z-10 flex flex-col gap-5 overflow-y-auto p-8"
         aria-label="Mesh controls"
+        aria-busy={isExportingVideo}
+        inert={isExportingVideo}
       >
         <Tabs value={activeTab} onChange={setActiveTab} />
 
@@ -1795,6 +2119,7 @@ function App() {
                 {singleFormatOptions.map((option) => (
                   <button
                     aria-pressed={exportFormats.has(option.label)}
+                    disabled={isExportingVideo}
                     key={option.label}
                     className={cn(
                       "format-toggle",
@@ -1840,7 +2165,7 @@ function App() {
                   >
                     <span>
                       {isExportingVideo
-                        ? "Recording..."
+                        ? "Exporting..."
                         : exportFormats.size > 1
                           ? `Export Video (${exportFormats.size} formats)`
                           : "Export Video"}
@@ -1872,6 +2197,20 @@ function App() {
                     onVideoFormatChange={setVideoExportFormat}
                   />
                 </div>
+                {videoExportNotice ? (
+                  <p
+                    aria-live="polite"
+                    className={cn(
+                      "rounded-md border px-3 py-2 text-xs font-semibold",
+                      videoExportNotice.kind === "success"
+                        ? "border-emerald-500/35 text-emerald-700"
+                        : "border-red-500/35 text-red-700",
+                    )}
+                    role="status"
+                  >
+                    {videoExportNotice.message}
+                  </p>
+                ) : null}
               </div>
             </div>
 
@@ -1882,6 +2221,7 @@ function App() {
               <span className="audio-file-input">
                 <input
                   accept="audio/*,.mp3,.wav,.m4a,.aac,.ogg"
+                  disabled={isExportingVideo}
                   type="file"
                   onChange={handleAudioFileChange}
                 />
@@ -1916,13 +2256,18 @@ function App() {
                 <span className="flex items-center justify-between gap-4 text-sm font-semibold text-[var(--muted-foreground)]">
                   <span>Frame</span>
                   <strong className="text-xs text-[var(--primary)]">
-                    {formatTimelineFrame(timelineFrame)}
+                    {formatTimelineFrame(
+                      isPaused ? pausedFrame + frameOffset : timelineFrame,
+                    )}
                   </strong>
                 </span>
                 <Slider
                   aria-label="Timeline"
                   className="timeline-slider"
                   data-frame-offset={Math.round(frameOffset)}
+                  data-render-frame={Math.round(
+                    isPaused ? pausedFrame + frameOffset : timelineFrame,
+                  )}
                   data-frame-scrubber
                   disabled={isExportingVideo}
                   max={meshFrameMax}
@@ -2214,79 +2559,18 @@ function App() {
         onPointerUp={stopPreviewDrag}
       >
         <div className="preview-artboard" style={previewArtboardStyle}>
-          <div className="format-overview" data-format-count={visiblePreviewFormats.length}>
-            {visiblePreviewFormats.map((previewFormat) => {
-              const formatProgress =
-                videoExportProgress?.formatLabel === previewFormat.label
-                  ? videoExportProgress.progress
-                  : 0;
-              const isRecordingFormat =
-                isExportingVideo && videoExportProgress?.formatLabel === previewFormat.label;
-
-              return (
-                <div className="format-overview-item" key={previewFormat.label}>
-                  <span>{previewFormat.label}</span>
-                  <div
-                    data-format-label={previewFormat.label}
-                    className={cn(
-                      "format-frame",
-                      getPreviewFrameClass(previewFormat.label),
-                    )}
-                    style={
-                      {
-                        ...frameAudioStyle,
-                        "--format-ratio": `${previewFormat.width / previewFormat.height}`,
-                        aspectRatio: `${previewFormat.width} / ${previewFormat.height}`,
-                      } as CSSProperties
-                    }
-                  >
-                    <ShaderStage
-                      audioBands={audioBands}
-                      audioLevel={audioLevel}
-                      ref={(handle) => {
-                        formatStageRefs.current[previewFormat.label] = handle;
-
-                        if (previewFormat.label === primaryPreviewFormat.label) {
-                          stageRef.current = handle;
-                        }
-                      }}
-                      backgroundColor={backgroundColor}
-                      blobs={blobs}
-                      isPaused={isPaused || isExportingVideo}
-                      mesh={mesh}
-                    />
-                    <VisualOverlayMark
-                      audioSpectrum={audioSpectrum}
-                      audioLevel={audioLevel}
-                      frameShape={frameShape}
-                      overlay={visualOverlay}
-                      waveformStyle={waveformStyle}
-                    />
-                    <SceneDecorations overlay={visualOverlay} />
-                  </div>
-                  <div
-                    aria-hidden={!isRecordingFormat}
-                    aria-label={
-                      isRecordingFormat
-                        ? `${previewFormat.label} exporting ${Math.round(formatProgress * 100)}%`
-                        : undefined
-                    }
-                    className={cn(
-                      "format-export-progress",
-                      !isRecordingFormat && "format-export-progress-hidden",
-                    )}
-                    style={{ "--format-progress": formatProgress.toFixed(4) } as CSSProperties}
-                  >
-                    <span className="format-export-progress-track">
-                      <span className="format-export-progress-fill" />
-                    </span>
-                    <span className="format-export-progress-label">
-                      {Math.round(formatProgress * 100)}%
-                    </span>
-                  </div>
-                </div>
-              );
-            })}
+          <div
+            className="format-overview"
+            data-format-count={visiblePreviewFormats.length}
+            data-primary-format={primaryPreviewFormat.label}
+          >
+            {renderPreviewFormat(primaryPreviewFormat)}
+            <div className="format-overview-wing format-overview-wing-left">
+              {leftPreviewFormats.map(renderPreviewFormat)}
+            </div>
+            <div className="format-overview-wing format-overview-wing-right">
+              {rightPreviewFormats.map(renderPreviewFormat)}
+            </div>
           </div>
         </div>
         <div className="artboard-zoom-controls" aria-label="Preview zoom controls">
@@ -2328,6 +2612,15 @@ function App() {
                 <span>.</span>
                 <span>.</span>
                 <span>.</span>
+              </span>
+              <span className="recording-progress-detail">
+                Format {(videoExportProgress?.formatIndex ?? 0) + 1}/
+                {videoExportProgress?.totalFormats ?? 1}
+                {" · "}
+                {videoExportProgress?.completedFormats ?? 0} saved
+                {(videoExportProgress?.attempt ?? 1) > 1
+                  ? ` · retry ${videoExportProgress?.attempt}/${videoExportProgress?.maxAttempts}`
+                  : ""}
               </span>
             </span>
             <Button
@@ -2532,11 +2825,17 @@ function ExportVideoSettings({
               />
             ))
           )}
-          <MenuCheckItem
-            isSelected={isLoopEnabled}
-            label="Loop Video"
-            onClick={() => onLoopEnabledChange(!isLoopEnabled)}
-          />
+          {audioSource === "none" ? (
+            <MenuCheckItem
+              isSelected={isLoopEnabled}
+              label="Visual loop fade"
+              onClick={() => onLoopEnabledChange(!isLoopEnabled)}
+            />
+          ) : (
+            <div className="px-3 py-2 text-xs text-[var(--muted-foreground)]">
+              Visual loop fade is unavailable with audio.
+            </div>
+          )}
           <div className="my-1 h-px bg-[var(--border)]" role="separator" />
           <div className="px-3 py-1.5 text-xs font-bold uppercase text-[var(--muted-foreground)]">
             FPS
@@ -2610,34 +2909,6 @@ function getAudioBandColor(audioBands: number[], blobs: BlobConfig[]) {
   });
 
   return blobs[loudestBandIndex % blobs.length]?.color ?? blobs[0].color;
-}
-
-function spectrumToBands(spectrum: number[]) {
-  return Array.from({ length: 8 }, (_, bandIndex) => {
-    const start = Math.floor((bandIndex / 8) * spectrum.length);
-    const end = Math.max(
-      start + 1,
-      Math.floor(((bandIndex + 1) / 8) * spectrum.length),
-    );
-    let total = 0;
-
-    for (let index = start; index < end; index++) {
-      total += spectrum[index] ?? 0;
-    }
-
-    return Math.max(0, Math.min(1, total / (end - start)));
-  });
-}
-
-function spectrumToLevel(spectrum: number[]) {
-  return Math.max(
-    0,
-    Math.min(
-      1,
-      spectrum.reduce((sum, value) => sum + value, 0) /
-        Math.max(1, spectrum.length),
-    ),
-  );
 }
 
 type AutoRandomizeSettingsProps = {
@@ -3008,15 +3279,19 @@ function SceneQrCode({
 function VisualOverlayMark({
   audioSpectrum,
   audioLevel,
+  format,
   frameShape,
   overlay,
   waveformStyle,
+  waveformTimestampSeconds,
 }: {
   audioSpectrum: number[];
   audioLevel: number;
+  format: SingleFormatOption;
   frameShape: FrameShape;
   overlay: VisualOverlay;
   waveformStyle: WaveformStyle;
+  waveformTimestampSeconds: number;
 }) {
   const renderOverlay = getRenderableOverlay(overlay);
 
@@ -3025,8 +3300,10 @@ function VisualOverlayMark({
       <SoundWaveOverlay
         audioSpectrum={audioSpectrum}
         audioLevel={audioLevel}
+        format={format}
         tone={renderOverlay.tone}
         waveformStyle={waveformStyle}
+        waveformTimestampSeconds={waveformTimestampSeconds}
       />
     );
   }
@@ -3075,63 +3352,116 @@ function VisualOverlayMark({
 function SoundWaveOverlay({
   audioSpectrum,
   audioLevel,
+  format,
   tone,
   waveformStyle,
+  waveformTimestampSeconds,
 }: {
   audioSpectrum: number[];
   audioLevel: number;
+  format: SingleFormatOption;
   tone: OverlayTone;
   waveformStyle: WaveformStyle;
+  waveformTimestampSeconds: number;
 }) {
   void audioLevel;
   const style = getWaveformStyle(waveformStyle);
-  const noiseFloor = style.noiseFloor;
-  const totalBars = 64;
-  const halfBars = totalBars / 2;
-  const centerEnvelopePower = style.centerEnvelopePower;
-  const sideFloor = style.sideFloor;
-  const sideMotionMix = style.sideMotionMix;
-  const widthFactor = style.widthFactor;
-  const centerGain = style.centerGain;
-  const edgeGain = style.edgeGain;
-  const waveformCssVars = {
-    "--waveform-style-box-scale": style.boxScale.toFixed(3),
-  } as CSSProperties;
-  if (style.useStarProfile) {
-    const frameMax = audioSpectrum.reduce(
-      (m, b) => Math.max(m, Math.max(0, (b - noiseFloor) / (1 - noiseFloor))),
-      0.001,
+  const geometry = getWaveformGeometry(
+    format.exportWidth,
+    format.exportHeight,
+    style.boxScale,
+  );
+  const bars = createWaveformBars(
+    audioSpectrum,
+    style,
+    {
+      barCount: geometry.barCount,
+      timestampSeconds: waveformTimestampSeconds,
+    },
+  );
+  const peakHeightRatio = Math.max(
+    0,
+    ...bars.map((bar) => bar.heightRatio),
+  );
+  const edgeBlurRadius =
+    Math.min(format.exportWidth, format.exportHeight) *
+    WAVEFORM_EDGE_BLUR_MAX_RATIO;
+  const glowBlurRadius =
+    Math.min(format.exportWidth, format.exportHeight) *
+    WAVEFORM_GLOW_BLUR_MAX_RATIO;
+  const amplitudeScale = getWaveformAmplitudeScale(
+    format.exportWidth,
+    format.exportHeight,
+    geometry.height,
+    peakHeightRatio,
+    WAVEFORM_AMPLITUDE_SCALE,
+    edgeBlurRadius,
+  );
+  const maxGlowHeight = getWaveformMaxPeakHeight(
+    format.exportWidth,
+    format.exportHeight,
+    edgeBlurRadius,
+  );
+  const getRenderedBarHeight = (
+    bar: ReturnType<typeof createWaveformBars>[number],
+  ) =>
+    getWaveformRenderedBarHeight(
+      bar.heightRatio,
+      geometry.height,
+      amplitudeScale,
+      geometry.barWidth,
     );
-    _starNormalizedPeak = Math.max(_starNormalizedPeak * 0.9997, frameMax);
-  }
+  const getRenderedActivity = (
+    bar: ReturnType<typeof createWaveformBars>[number],
+  ) =>
+    getWaveformRenderedBarOpacityScale(
+      bar.heightRatio,
+      geometry.height,
+      amplitudeScale,
+      geometry.barWidth,
+    );
+  const getRenderedOpacity = (
+    bar: ReturnType<typeof createWaveformBars>[number],
+    layer: "blur" | "sharp",
+  ) => {
+    const layerOpacities = getWaveformBarLayerOpacities(bar);
+    const activityOpacity = getRenderedActivity(bar);
 
-  const bars = Array.from({ length: totalBars }, (_, index) => {
-    const mirroredIndex = index < halfBars ? halfBars - 1 - index : index - halfBars;
-    const centeredProgress = mirroredIndex / Math.max(halfBars - 1, 1);
-    const compressedProgress = 0.5 + (centeredProgress - 0.5) * widthFactor;
-    const sourceProgress = Math.max(0, Math.min(1, compressedProgress));
-    const sourceIndex = Math.floor(sourceProgress * (audioSpectrum.length - 1));
-    const band = audioSpectrum[sourceIndex] ?? 0;
-    const normalizedBand = Math.max(0, (band - noiseFloor) / (1 - noiseFloor));
-    const centerDistance =
-      Math.abs(index - (totalBars - 1) / 2) / ((totalBars - 1) / 2);
-    const centerEnvelope =
-      sideFloor + (1 - centerDistance) ** centerEnvelopePower * (1 - sideFloor);
-    const gainWeight = (1 - centerDistance) ** centerEnvelopePower;
-    const gain = edgeGain + (centerGain - edgeGain) * gainWeight;
-    const shapedBand =
-      normalizedBand * sideMotionMix + normalizedBand * centerEnvelope * (1 - sideMotionMix);
-    const effectiveBand = Math.max(0, Math.min(1, shapedBand * gain));
-    const bell = 1 + style.bellBoost * (1 - centerDistance) ** 6;
-    const height = style.useStarProfile
-      ? (normalizedBand / _starNormalizedPeak) * (STAR_BAR_PROFILE[mirroredIndex] ?? 1) * 100
-      : Math.max(0, Math.min(1, effectiveBand)) * 100 * bell * style.verticalGain;
-    const opacity = getWaveformBarOpacity(mirroredIndex);
-    return {
-      height: Math.min(165, Math.max(0, height)),
-      opacity,
-    };
-  });
+    return (
+      (layer === "blur"
+        ? layerOpacities.blurOpacity
+        : layerOpacities.sharpOpacity) * activityOpacity
+    );
+  };
+  const waveformCssVars = {
+    "--waveform-amplitude-scale": amplitudeScale.toFixed(6),
+    "--waveform-bar-width": `${
+      (geometry.barWidth / format.exportWidth) * 100
+    }cqw`,
+    "--waveform-edge-blur": `${
+      (edgeBlurRadius / format.exportWidth) * 100
+    }cqw`,
+    "--waveform-glow-blur": `${
+      (glowBlurRadius / format.exportWidth) * 100
+    }cqw`,
+    "--waveform-raw-peak-height-ratio": peakHeightRatio.toFixed(6),
+    "--waveform-style-box-scale": String(style.boxScale),
+    height: `${(geometry.height / format.exportHeight) * 100}%`,
+    width: `${(geometry.width / format.exportWidth) * 100}%`,
+  } as CSSProperties;
+  const getBarLeftPercent = (
+    index: number,
+    renderedBarWidth: number,
+  ) =>
+    ((getWaveformBarOffset(
+      index,
+      geometry.barStep,
+      geometry.pixelScale,
+    ) +
+      geometry.barCenterInset -
+      renderedBarWidth / 2) /
+      geometry.width) *
+    100;
 
   return (
     <span
@@ -3141,15 +3471,116 @@ function SoundWaveOverlay({
       )}
       style={waveformCssVars}
     >
-      <span className="sound-wave-overlay-track">
-        {bars.map((bar, index) => (
-          <span
-            aria-hidden="true"
-            className="sound-wave-overlay-bar"
-            key={index}
-            style={{ height: `${bar.height}%`, opacity: bar.opacity }}
-          />
-        ))}
+      <span
+        aria-hidden="true"
+        className="sound-wave-overlay-track sound-wave-overlay-track-glow"
+      >
+        {bars.map((bar, index) => {
+          const activityOpacity = getRenderedActivity(bar);
+          const renderedBarHeight = getRenderedBarHeight(bar);
+          const renderedBarWidth = getWaveformRenderedBarWidth(
+            renderedBarHeight,
+            geometry.barWidth,
+          );
+          const glowHeight = getWaveformGlowHeight(
+            renderedBarHeight,
+            geometry.height,
+            activityOpacity,
+            maxGlowHeight,
+          );
+          const centerOffset = getWaveformRenderedBarCenterOffset(
+            bar.centerOffsetRatio,
+            geometry.height,
+            amplitudeScale,
+          );
+
+          return (
+            <span
+              className="sound-wave-overlay-glow-bar"
+              key={index}
+              style={{
+                height: `${(glowHeight / geometry.height) * 100}%`,
+                left: `${getBarLeftPercent(index, renderedBarWidth)}%`,
+                opacity: getWaveformBarGlowOpacity(
+                  bar,
+                  activityOpacity,
+                ),
+                top: `${
+                  50 + (centerOffset / geometry.height) * 100
+                }%`,
+                width: `${
+                  (renderedBarWidth / geometry.width) * 100
+                }%`,
+              }}
+            />
+          );
+        })}
+      </span>
+      <span className="sound-wave-overlay-track sound-wave-overlay-track-sharp">
+        {bars.map((bar, index) => {
+          const renderedBarHeight = getRenderedBarHeight(bar);
+          const renderedBarWidth = getWaveformRenderedBarWidth(
+            renderedBarHeight,
+            geometry.barWidth,
+          );
+          const centerOffset = getWaveformRenderedBarCenterOffset(
+            bar.centerOffsetRatio,
+            geometry.height,
+            amplitudeScale,
+          );
+          return (
+            <span
+              aria-hidden="true"
+              className="sound-wave-overlay-bar"
+              key={index}
+              style={{
+                height: `${(renderedBarHeight / geometry.height) * 100}%`,
+                left: `${getBarLeftPercent(index, renderedBarWidth)}%`,
+                opacity: getRenderedOpacity(bar, "sharp"),
+                top: `${
+                  50 + (centerOffset / geometry.height) * 100
+                }%`,
+                width: `${
+                  (renderedBarWidth / geometry.width) * 100
+                }%`,
+              } as CSSProperties}
+            />
+          );
+        })}
+      </span>
+      <span
+        aria-hidden="true"
+        className="sound-wave-overlay-track sound-wave-overlay-track-blur"
+      >
+        {bars.map((bar, index) => {
+          const renderedBarHeight = getRenderedBarHeight(bar);
+          const renderedBarWidth = getWaveformRenderedBarWidth(
+            renderedBarHeight,
+            geometry.barWidth,
+          );
+          const centerOffset = getWaveformRenderedBarCenterOffset(
+            bar.centerOffsetRatio,
+            geometry.height,
+            amplitudeScale,
+          );
+          return (
+            <span
+              className="sound-wave-overlay-blur-bar"
+              key={index}
+              style={{
+                height: `${(renderedBarHeight / geometry.height) * 100}%`,
+                left: `${getBarLeftPercent(index, renderedBarWidth)}%`,
+                opacity: getRenderedOpacity(bar, "blur"),
+                top: `${
+                  50 + (centerOffset / geometry.height) * 100
+                }%`,
+                width: `${
+                  (renderedBarWidth / geometry.width) * 100
+                }%`,
+              } as CSSProperties}
+            />
+          );
+        })}
       </span>
     </span>
   );
@@ -3618,9 +4049,7 @@ function clampFrame(frame: number) {
 
 function getLoopFadeAmount(elapsedMs: number, durationMs: number) {
   const fadeDurationMs = Math.min(3000, durationMs * 0.25);
-  const holdDurationMs = Math.min(250, durationMs * 0.05);
-  const fadeEndMs = durationMs - holdDurationMs;
-  const fadeStartMs = fadeEndMs - fadeDurationMs;
+  const fadeStartMs = durationMs - fadeDurationMs;
   const progress = Math.min(
     1,
     Math.max(0, (elapsedMs - fadeStartMs) / fadeDurationMs),
@@ -3651,18 +4080,495 @@ function autoRandomizeIntervalOptions() {
   ];
 }
 
-function waitForNextAnimationFrame() {
-  return new Promise<void>((resolve) => {
-    window.requestAnimationFrame(() => resolve());
-  });
-}
-
 async function waitForFontsReady() {
   if (!("fonts" in document)) {
     return;
   }
 
   await document.fonts.ready.catch(() => undefined);
+}
+
+async function assertVideoExportFormatsSupported(options: {
+  audioBuffer?: AudioBuffer;
+  bitratePreset: VideoBitratePreset;
+  detectOfflineVideoEncoderSupport: typeof import("./export/videoEncoder").detectOfflineVideoEncoderSupport;
+  formats: readonly SingleFormatOption[];
+  outputFormat: VideoExportFormat;
+  signal: AbortSignal;
+}) {
+  const {
+    audioBuffer,
+    bitratePreset,
+    detectOfflineVideoEncoderSupport,
+    formats,
+    outputFormat,
+    signal,
+  } = options;
+
+  for (const format of formats) {
+    throwIfVideoExportAborted(signal);
+    const canvas = document.createElement("canvas");
+    canvas.width = format.exportWidth;
+    canvas.height = format.exportHeight;
+
+    try {
+      const support = await detectOfflineVideoEncoderSupport({
+        audioBuffer,
+        bitrate: getCompressedVideoBitrate(format, bitratePreset),
+        canvas,
+        format: outputFormat,
+        hardwareAcceleration: "no-preference",
+        signal,
+      });
+
+      if (!support.supported) {
+        throw new Error(
+          `${format.label} is not supported: ${
+            support.unsupportedReason ?? "encoder configuration unavailable"
+          }`,
+        );
+      }
+    } finally {
+      canvas.width = 1;
+      canvas.height = 1;
+    }
+  }
+}
+
+function createVideoExportAttemptScope(
+  parentSignal: AbortSignal,
+  formatLabel: string,
+) {
+  const controller = new AbortController();
+  let timeoutId: number | null = null;
+  let isDisposed = false;
+  const forwardParentAbort = () => {
+    controller.abort(
+      parentSignal.reason ??
+        new DOMException("Video export cancelled.", "AbortError"),
+    );
+  };
+  const heartbeat = () => {
+    if (isDisposed || controller.signal.aborted) {
+      return;
+    }
+
+    if (timeoutId !== null) {
+      window.clearTimeout(timeoutId);
+    }
+
+    timeoutId = window.setTimeout(() => {
+      const error = new Error(
+        `${formatLabel} made no export progress for ${
+          videoFormatStallTimeoutMs / 1000
+        } seconds.`,
+      );
+      error.name = "VideoExportStallError";
+      controller.abort(error);
+    }, videoFormatStallTimeoutMs);
+  };
+
+  if (parentSignal.aborted) {
+    forwardParentAbort();
+  } else {
+    parentSignal.addEventListener("abort", forwardParentAbort, {
+      once: true,
+    });
+  }
+  heartbeat();
+
+  return {
+    dispose() {
+      isDisposed = true;
+      parentSignal.removeEventListener("abort", forwardParentAbort);
+
+      if (timeoutId !== null) {
+        window.clearTimeout(timeoutId);
+        timeoutId = null;
+      }
+    },
+    heartbeat,
+    signal: controller.signal,
+  };
+}
+
+function raceWithAbortSignal<T>(
+  promise: Promise<T>,
+  signal: AbortSignal,
+): Promise<T> {
+  if (signal.aborted) {
+    return Promise.reject(
+      signal.reason ??
+        new DOMException("Video export cancelled.", "AbortError"),
+    );
+  }
+
+  return new Promise<T>((resolve, reject) => {
+    const handleAbort = () => {
+      reject(
+        signal.reason ??
+          new DOMException("Video export cancelled.", "AbortError"),
+      );
+    };
+    const settle = (callback: (value: T) => void, value: T) => {
+      signal.removeEventListener("abort", handleAbort);
+      callback(value);
+    };
+
+    signal.addEventListener("abort", handleAbort, { once: true });
+    promise.then(
+      (value) => settle(resolve, value),
+      (error) => {
+        signal.removeEventListener("abort", handleAbort);
+        reject(error);
+      },
+    );
+  });
+}
+
+async function waitForVideoEncoderRecovery(signal: AbortSignal) {
+  await raceWithAbortSignal(
+    new Promise<void>((resolve) => {
+      window.setTimeout(resolve, videoEncoderRecoveryDelayMs);
+    }),
+    signal,
+  );
+}
+
+function isFatalVideoOutputError(error: unknown) {
+  const errorName =
+    error instanceof DOMException || error instanceof Error
+      ? error.name
+      : "";
+
+  return [
+    "NotAllowedError",
+    "NotFoundError",
+    "QuotaExceededError",
+    "SecurityError",
+  ].includes(errorName);
+}
+
+function getErrorMessage(error: unknown) {
+  return error instanceof Error && error.message.trim()
+    ? error.message
+    : "unknown export error";
+}
+
+function createVideoExportBatchNotice(
+  completedFormats: CompletedVideoExportFormat[],
+  failedFormats: FailedVideoExportFormat[],
+  totalFormats: number,
+): VideoExportNotice {
+  const totalBytes = completedFormats.reduce(
+    (sum, format) => sum + format.sizeBytes,
+    0,
+  );
+
+  if (failedFormats.length === 0) {
+    return {
+      kind: "success",
+      message: `Export complete: ${completedFormats.length}/${totalFormats} formats saved (${formatByteCount(totalBytes)}).`,
+    };
+  }
+
+  return {
+    kind: "error",
+    message:
+      `Export completed partially: ${completedFormats.length}/${totalFormats} formats saved. ` +
+      `Failed: ${failedFormats
+        .map(({ formatLabel, reason }) => `${formatLabel} — ${reason}`)
+        .join("; ")}.`,
+  };
+}
+
+function formatByteCount(bytes: number) {
+  if (!Number.isFinite(bytes) || bytes <= 0) {
+    return "0 B";
+  }
+
+  const units = ["B", "KB", "MB", "GB"];
+  const unitIndex = Math.min(
+    units.length - 1,
+    Math.floor(Math.log(bytes) / Math.log(1024)),
+  );
+  const value = bytes / 1024 ** unitIndex;
+
+  return `${value.toFixed(unitIndex === 0 ? 0 : 1)} ${units[unitIndex]}`;
+}
+
+async function renderAndEncodeVideoTarget(options: {
+  audioAnalysisTimeline?: import("./export/audioAnalysis").AudioAnalysisTimeline;
+  audioBuffer?: AudioBuffer;
+  backgroundColor: string;
+  bitrate: number;
+  blobs: BlobConfig[];
+  durationSeconds: number;
+  encodeOfflineVideo: typeof import("./export/videoEncoder").encodeOfflineVideo;
+  format: SingleFormatOption;
+  frameRate: VideoFrameRate;
+  hardwareAcceleration: import("./export/videoEncoder").OfflineVideoHardwareAcceleration;
+  isLoopable: boolean;
+  mesh: MeshConfig;
+  onProgress: (progress: number) => void;
+  outputFile: import("./export/outputDestination").VideoOutputFile;
+  outputFormat: VideoExportFormat;
+  overlay: VisualOverlay;
+  overlayImage: HTMLImageElement | null;
+  qrImage: HTMLImageElement | null;
+  signal: AbortSignal;
+  topLogoImage: HTMLImageElement | null;
+  waveformStyle: WaveformStyle;
+}) {
+  const {
+    audioAnalysisTimeline,
+    audioBuffer,
+    backgroundColor,
+    bitrate,
+    blobs,
+    durationSeconds,
+    encodeOfflineVideo,
+    format,
+    frameRate,
+    hardwareAcceleration,
+    isLoopable,
+    mesh,
+    onProgress,
+    outputFile,
+    outputFormat,
+    overlay,
+    overlayImage,
+    qrImage,
+    signal,
+    topLogoImage,
+    waveformStyle,
+  } = options;
+  const width = format.exportWidth;
+  const height = format.exportHeight;
+  const shaderCanvas = document.createElement("canvas");
+  const outputCanvas = document.createElement("canvas");
+  outputCanvas.width = width;
+  outputCanvas.height = height;
+  const outputContext = outputCanvas.getContext("2d", {
+    alpha: false,
+    desynchronized: false,
+  });
+
+  if (!outputContext) {
+    throw new Error("The browser could not create the video render surface.");
+  }
+
+  const zeroBands = new Float32Array(8);
+  const shaderBands = new Float32Array(8);
+  let loopStartCanvas: HTMLCanvasElement | null = null;
+  let loopStartContext: CanvasRenderingContext2D | null = null;
+  let shaderRenderer: ShaderRenderer | null = null;
+
+  try {
+    shaderRenderer = new ShaderRenderer({
+      audioBands: zeroBands,
+      audioLevel: 0,
+      backgroundColor,
+      blobs,
+      canvas: shaderCanvas,
+      mesh,
+      // The frame is copied into a 2D canvas immediately after each render.
+      // Preserving this single, sequential export buffer avoids driver-specific
+      // clearing while still keeping memory bounded to one target at a time.
+      preserveDrawingBuffer: true,
+      releaseContextOnDispose: true,
+    });
+    shaderRenderer.setSize(width, height, 1);
+
+    if (isLoopable) {
+      loopStartCanvas = document.createElement("canvas");
+      loopStartCanvas.width = width;
+      loopStartCanvas.height = height;
+      loopStartContext = loopStartCanvas.getContext("2d", { alpha: false });
+
+      if (!loopStartContext) {
+        throw new Error("The browser could not create the loop render surface.");
+      }
+    }
+
+    const result = await encodeOfflineVideo({
+      audioAnalysisTimeline,
+      audioBuffer,
+      bitrate,
+      canvas: outputCanvas,
+      durationSeconds,
+      format: outputFormat,
+      fps: frameRate,
+      hardwareAcceleration,
+      onProgress,
+      signal,
+      target: outputFile.target,
+      renderFrame: ({
+        audioSpectrum,
+        frameDurationSeconds,
+        frameIndex,
+        timestampSeconds,
+      }) => {
+        throwIfVideoExportAborted(signal);
+        writeSpectrumBands(audioSpectrum, shaderBands);
+        const audioLevelForFrame = getSpectrumLevel(audioSpectrum);
+        // The offline spectrum timeline already applies attack/release
+        // smoothing. Snap it into the shader so the mesh and waveform use the
+        // same frame and frame zero is not forced to silence.
+        shaderRenderer?.setAudioTarget(
+          shaderBands,
+          audioLevelForFrame,
+          true,
+        );
+        const rendered = shaderRenderer?.renderAt(
+          mesh.frame + timestampSeconds * 1000 * mesh.speed,
+          1000 / frameRate,
+        );
+
+        if (!rendered) {
+          throw new Error(
+            "The graphics context was lost while rendering the video.",
+          );
+        }
+
+        outputContext.globalAlpha = 1;
+        outputContext.globalCompositeOperation = "copy";
+        outputContext.filter = "none";
+        outputContext.drawImage(shaderCanvas, 0, 0, width, height);
+        outputContext.globalCompositeOperation = "source-over";
+        drawOverlay(outputContext, width, height, {
+          audioLevel: audioLevelForFrame,
+          audioSpectrum,
+          image: overlayImage,
+          overlay,
+          qrImage,
+          topLogoImage,
+          waveformStyle,
+          waveformTimestampSeconds:
+            timestampSeconds + frameDurationSeconds / 2,
+        });
+
+        if (loopStartCanvas && loopStartContext && frameIndex === 0) {
+          loopStartContext.drawImage(outputCanvas, 0, 0);
+        } else if (loopStartCanvas) {
+          const loopFade = getLoopFadeAmount(
+            timestampSeconds * 1000,
+            durationSeconds * 1000,
+          );
+
+          if (loopFade > 0) {
+            outputContext.save();
+            outputContext.globalAlpha = loopFade;
+            outputContext.drawImage(loopStartCanvas, 0, 0);
+            outputContext.restore();
+          }
+        }
+      },
+    });
+
+    return await outputFile.finish(result.mimeType);
+  } finally {
+    shaderRenderer?.dispose();
+    outputCanvas.width = 1;
+    outputCanvas.height = 1;
+
+    if (loopStartCanvas) {
+      loopStartCanvas.width = 1;
+      loopStartCanvas.height = 1;
+    }
+  }
+}
+
+function writeSpectrumBands(
+  spectrum: ArrayLike<number>,
+  output: Float32Array,
+) {
+  for (let bandIndex = 0; bandIndex < output.length; bandIndex += 1) {
+    const start = Math.floor((bandIndex / output.length) * spectrum.length);
+    const end = Math.max(
+      start + 1,
+      Math.floor(((bandIndex + 1) / output.length) * spectrum.length),
+    );
+    let total = 0;
+
+    for (let spectrumIndex = start; spectrumIndex < end; spectrumIndex += 1) {
+      total += spectrum[spectrumIndex] ?? 0;
+    }
+
+    output[bandIndex] = Math.max(
+      0,
+      Math.min(1, total / Math.max(1, end - start)),
+    );
+  }
+}
+
+function getSpectrumLevel(spectrum: ArrayLike<number>) {
+  let total = 0;
+
+  for (let index = 0; index < spectrum.length; index += 1) {
+    total += spectrum[index] ?? 0;
+  }
+
+  return Math.max(0, Math.min(1, total / Math.max(1, spectrum.length)));
+}
+
+function getVideoFormatOverallProgress(
+  formatIndex: number,
+  formatProgress: number,
+  totalFormats: number,
+) {
+  const normalizedFormatProgress =
+    (Math.max(0, formatIndex) + Math.max(0, Math.min(1, formatProgress))) /
+    Math.max(1, totalFormats);
+
+  return (
+    videoPreparationProgressWeight +
+    normalizedFormatProgress * (1 - videoPreparationProgressWeight)
+  );
+}
+
+function createThrottledProgressReporter(
+  report: (progress: number) => void,
+) {
+  let lastProgress = -1;
+  let lastReportedAt = -Infinity;
+
+  return (progress: number) => {
+    const clampedProgress = Math.max(0, Math.min(1, progress));
+    const now = performance.now();
+
+    if (
+      clampedProgress >= 1 ||
+      lastProgress < 0 ||
+      clampedProgress - lastProgress >= 0.005 ||
+      now - lastReportedAt >= 200
+    ) {
+      lastProgress = clampedProgress;
+      lastReportedAt = now;
+      report(clampedProgress);
+    }
+  };
+}
+
+function throwIfVideoExportAborted(signal: AbortSignal) {
+  if (signal.aborted) {
+    throw signal.reason ?? new DOMException("Video export cancelled.", "AbortError");
+  }
+}
+
+function isAbortError(error: unknown) {
+  return (
+    (error instanceof DOMException && error.name === "AbortError") ||
+    (error instanceof Error && error.name === "AbortError")
+  );
+}
+
+function getVideoExportErrorMessage(error: unknown) {
+  if (error instanceof Error && error.message.trim()) {
+    return `Video export failed: ${error.message}`;
+  }
+
+  return "Video export failed because of an unknown browser error.";
 }
 
 function normalizeMesh(meshToNormalize: MeshConfig): MeshConfig {
@@ -3686,6 +4592,21 @@ function normalizeMesh(meshToNormalize: MeshConfig): MeshConfig {
     scale: finiteNumber(meshToNormalize.scale, initialMesh.scale),
     speed: finiteNumber(meshToNormalize.speed, initialMesh.speed),
     swirl: finiteNumber(meshToNormalize.swirl, initialMesh.swirl),
+  };
+}
+
+function normalizeRenderMesh(meshToNormalize: MeshConfig): MeshConfig {
+  return {
+    ...normalizeMesh(meshToNormalize),
+    frame: finiteNumber(meshToNormalize.frame, 0),
+  };
+}
+
+function applyPresetAudioDefaults(meshToNormalize: MeshConfig): MeshConfig {
+  return {
+    ...meshToNormalize,
+    audioReactivity: presetAudioReactivity,
+    audioSmoothness: presetAudioSmoothness,
   };
 }
 
@@ -3727,12 +4648,6 @@ function cloneBlobs(blobsToClone: BlobConfig[]) {
 
 function cloneFormat(formatToClone: FormatConfig): FormatConfig {
   return { ...formatToClone };
-}
-
-function getFormatOption(label: string) {
-  return (
-    formatOptions.find((option) => option.label === label) ?? formatOptions[0]
-  );
 }
 
 function getPreviewFrameClass(label: string) {
@@ -3784,8 +4699,10 @@ async function captureTargetPng(
   qrImage: HTMLImageElement | null,
   topLogoImage: HTMLImageElement | null,
   waveformStyle: WaveformStyle,
+  frame: number,
+  waveformTimestampSeconds: number,
 ) {
-  const canvas = handle.getCanvas();
+  const canvas = handle.getCanvas(frame);
 
   if (!canvas) {
     return null;
@@ -3817,7 +4734,9 @@ async function captureTargetPng(
     qrImage,
     topLogoImage,
     overlay,
+    pixelScale: scale,
     waveformStyle,
+    waveformTimestampSeconds,
   });
 
   return exportCanvas.toDataURL("image/png");
@@ -3869,12 +4788,14 @@ function drawOverlay(
   height: number,
   options: {
     audioLevel: number;
-    audioSpectrum: number[];
+    audioSpectrum: ArrayLike<number>;
     image: HTMLImageElement | null;
     qrImage: HTMLImageElement | null;
     topLogoImage: HTMLImageElement | null;
     overlay: VisualOverlay;
+    pixelScale?: number;
     waveformStyle: WaveformStyle;
+    waveformTimestampSeconds?: number;
   },
 ) {
   const {
@@ -3884,7 +4805,9 @@ function drawOverlay(
     qrImage,
     topLogoImage,
     overlay,
+    pixelScale = 1,
     waveformStyle,
+    waveformTimestampSeconds,
   } = options;
   void audioLevel;
   const color = overlay.tone === "dark" ? "#020617" : "#ffffff";
@@ -3901,6 +4824,8 @@ function drawOverlay(
       audioSpectrum,
       color,
       waveformStyle,
+      pixelScale,
+      waveformTimestampSeconds,
     );
   } else if (image && overlay.asset !== "none") {
     const imageRatio = image.naturalWidth / image.naturalHeight;
@@ -3951,412 +4876,500 @@ function drawWaveformOverlay(
   context: CanvasRenderingContext2D,
   width: number,
   height: number,
-  audioSpectrum: number[],
+  audioSpectrum: ArrayLike<number>,
   color: string,
   waveformStyle: WaveformStyle,
+  pixelScale = 1,
+  timestampSeconds?: number,
 ) {
   const style = getWaveformStyle(waveformStyle);
-  const totalBars = 64;
-  const halfBars = totalBars / 2;
-  const noiseFloor = style.noiseFloor;
-  const centerEnvelopePower = style.centerEnvelopePower;
-  const sideFloor = style.sideFloor;
-  const sideMotionMix = style.sideMotionMix;
-  const widthFactor = style.widthFactor;
-  const centerGain = style.centerGain;
-  const edgeGain = style.edgeGain;
-  const sceneWaveBounds = getSceneWaveBounds(width, height, style);
+  const bars = createWaveformBars(
+    audioSpectrum,
+    style,
+    {
+      barCount: getWaveformBarCount(width, height),
+      timestampSeconds,
+    },
+  );
+  const peakHeightRatio = Math.max(
+    0,
+    ...bars.map((bar) => bar.heightRatio),
+  );
+  const edgeBlurRadius =
+    Math.min(width, height) * WAVEFORM_EDGE_BLUR_MAX_RATIO;
+  const glowBlurRadius =
+    Math.min(width, height) * WAVEFORM_GLOW_BLUR_MAX_RATIO;
+  const sceneWaveBounds = getSceneWaveBounds(
+    width,
+    height,
+    style,
+    peakHeightRatio,
+    edgeBlurRadius,
+    pixelScale,
+  );
   const overlayWidth = sceneWaveBounds.width;
   const overlayHeight = sceneWaveBounds.height;
   const waveformAmplitudeScale = sceneWaveBounds.amplitudeScale;
   const left = (width - overlayWidth) / 2;
   const top = (height - overlayHeight) / 2;
-  const gap = Math.max(2, overlayWidth * 0.0046);
-  const barWidth = Math.max(2, (overlayWidth - gap * (totalBars - 1)) / totalBars);
+  const barStep = sceneWaveBounds.barStep;
+  const barWidth = sceneWaveBounds.barWidth;
+  const barCenterInset = sceneWaveBounds.barCenterInset;
+  const barPixelScale = sceneWaveBounds.pixelScale;
 
-  if (style.useStarProfile) {
-    const frameMax = audioSpectrum.reduce(
-      (m, b) => Math.max(m, Math.max(0, (b - noiseFloor) / (1 - noiseFloor))),
-      0.001,
-    );
-    _starNormalizedPeak = Math.max(_starNormalizedPeak * 0.9997, frameMax);
-  }
-
-  const drawBars = (opacityMultiplier: number) => {
-    context.fillStyle = color;
-    for (let index = 0; index < totalBars; index++) {
-      const mirroredIndex = index < halfBars ? halfBars - 1 - index : index - halfBars;
-      const centeredProgress = mirroredIndex / Math.max(halfBars - 1, 1);
-      const compressedProgress = 0.5 + (centeredProgress - 0.5) * widthFactor;
-      const sourceProgress = Math.max(0, Math.min(1, compressedProgress));
-      const sourceIndex = Math.floor(sourceProgress * (audioSpectrum.length - 1));
-      const band = Math.max(0, Math.min(1, audioSpectrum[sourceIndex] ?? 0));
-      const normalizedBand = Math.max(0, (band - noiseFloor) / (1 - noiseFloor));
-      const centerDistance =
-        Math.abs(index - (totalBars - 1) / 2) / ((totalBars - 1) / 2);
-      const centerEnvelope =
-        sideFloor + (1 - centerDistance) ** centerEnvelopePower * (1 - sideFloor);
-      const gainWeight = (1 - centerDistance) ** centerEnvelopePower;
-      const gain = edgeGain + (centerGain - edgeGain) * gainWeight;
-      const effectiveBand =
-        normalizedBand * sideMotionMix + normalizedBand * centerEnvelope * (1 - sideMotionMix);
-      const boostedBand = Math.max(0, Math.min(1, effectiveBand * gain * style.verticalGain));
-      const bell = 1 + style.bellBoost * (1 - centerDistance) ** 6;
-      const rawBarHeight = style.useStarProfile
-        ? (normalizedBand / _starNormalizedPeak) *
-          (STAR_BAR_PROFILE[mirroredIndex] ?? 1) *
-          overlayHeight *
-          waveformAmplitudeScale
-        : boostedBand * overlayHeight * bell * waveformAmplitudeScale;
-      const barHeight = Math.min(overlayHeight * 1.65, rawBarHeight);
-
-      if (barHeight <= 0) {
-        continue;
-      }
-
-      const x = left + index * (barWidth + gap);
-      const y = top + (overlayHeight - barHeight) / 2;
-      context.globalAlpha = opacityMultiplier * getWaveformBarOpacity(mirroredIndex);
-      const radius = Math.min(barWidth / 2, 5);
-      drawRoundedRect(context, x, y, barWidth, barHeight, radius);
-      context.fill();
-    }
-  };
-
-  drawBars(1);
-  context.globalAlpha = 1;
-}
-
-function drawVisiblePreviewOverlay(
-  context: CanvasRenderingContext2D,
-  formatLabel: string,
-  audioSpectrum: number[],
-  overlay: VisualOverlay,
-  topLogoImage: HTMLImageElement | null,
-  waveformStyle: WaveformStyle,
-) {
-  const frameElement = getVisibleFormatFrame(formatLabel);
-
-  if (!frameElement) {
-    return false;
-  }
-
-  context.save();
-  context.globalAlpha = 1;
-  context.filter = "none";
-
-  let needsFallback = false;
-
-  if (overlay.asset === "waveform") {
-    drawVisibleWaveform(context, frameElement, audioSpectrum, overlay.tone, waveformStyle);
-  } else if (overlay.asset !== "none") {
-    needsFallback = !drawVisibleCenterOverlay(context, frameElement);
-  }
-
-  if (overlay.showTopLogo && topLogoImage) {
-    drawVisibleLogo(context, frameElement, topLogoImage);
-  }
-
-  if (overlay.showBottomLeftSlogan || overlay.showBottomCta) {
-    drawVisibleBottomContent(context, frameElement);
-  }
-
-  context.restore();
-
-  return !needsFallback;
-}
-
-function getVisibleFormatFrame(formatLabel: string) {
-  return Array.from(document.querySelectorAll<HTMLElement>(".format-frame"))
-    .find((element) => element.dataset.formatLabel === formatLabel) ?? null;
-}
-
-function getExportRect(
-  element: Element,
-  frameElement: HTMLElement,
-  canvasWidth: number,
-  canvasHeight: number,
-) {
-  const frameRect = frameElement.getBoundingClientRect();
-  const elementRect = element.getBoundingClientRect();
-  const scaleX = canvasWidth / Math.max(frameRect.width, 1);
-  const scaleY = canvasHeight / Math.max(frameRect.height, 1);
-
-  return {
-    height: elementRect.height * scaleY,
-    width: elementRect.width * scaleX,
-    x: (elementRect.left - frameRect.left) * scaleX,
-    y: (elementRect.top - frameRect.top) * scaleY,
-  };
-}
-
-function drawVisibleWaveform(
-  context: CanvasRenderingContext2D,
-  frameElement: HTMLElement,
-  audioSpectrum: number[],
-  tone: OverlayTone,
-  waveformStyle: WaveformStyle,
-) {
-  const waveElement = frameElement.querySelector<HTMLElement>(".sound-wave-overlay");
-  const trackElement = frameElement.querySelector<HTMLElement>(".sound-wave-overlay-track");
-  const firstBarElement = frameElement.querySelector<HTMLElement>(".sound-wave-overlay-bar");
-
-  if (!waveElement || !trackElement || !firstBarElement) {
-    return;
-  }
-
-  const style = getWaveformStyle(waveformStyle);
-  const totalBars = 64;
-  const halfBars = totalBars / 2;
-  const noiseFloor = style.noiseFloor;
-  const centerEnvelopePower = style.centerEnvelopePower;
-  const sideFloor = style.sideFloor;
-  const sideMotionMix = style.sideMotionMix;
-  const widthFactor = style.widthFactor;
-  const centerGain = style.centerGain;
-  const edgeGain = style.edgeGain;
-  const measuredWaveRect = getExportRect(
-    waveElement,
-    frameElement,
-    context.canvas.width,
-    context.canvas.height,
+  drawWaveformGlowLayer(
+    context,
+    bars,
+    color,
+    width,
+    height,
+    left,
+    top + overlayHeight / 2,
+    overlayWidth,
+    overlayHeight,
+    waveformAmplitudeScale,
+    barWidth,
+    barCenterInset,
+    barStep,
+    barPixelScale,
+    edgeBlurRadius,
+    glowBlurRadius,
   );
-  const waveRect = {
-    ...measuredWaveRect,
-    x: (context.canvas.width - measuredWaveRect.width) / 2,
-    y: (context.canvas.height - measuredWaveRect.height) / 2,
-  };
-  const firstBarRect = getExportRect(firstBarElement, frameElement, context.canvas.width, context.canvas.height);
-  const frameRect = frameElement.getBoundingClientRect();
-  const scaleX = context.canvas.width / Math.max(frameRect.width, 1);
-  const trackStyle = getComputedStyle(trackElement);
-  const gap = Math.max(0, parseFloat(trackStyle.columnGap || trackStyle.gap || "0") * scaleX);
-  const barWidth =
-    firstBarRect.width > 0
-      ? firstBarRect.width
-      : Math.max(2, (waveRect.width - gap * (totalBars - 1)) / totalBars);
-  const barsWidth = totalBars * barWidth + (totalBars - 1) * gap;
-  const startX = waveRect.x + (waveRect.width - barsWidth) / 2;
-  const color = tone === "dark" ? "#020617" : "#ffffff";
+
+  drawWaveformBlurLayer(
+    context,
+    bars,
+    color,
+    width,
+    height,
+    left,
+    top + overlayHeight / 2,
+    overlayWidth,
+    overlayHeight,
+    waveformAmplitudeScale,
+    barWidth,
+    barCenterInset,
+    barStep,
+    barPixelScale,
+    edgeBlurRadius,
+  );
 
   context.fillStyle = color;
-  context.globalAlpha = 1;
+  context.filter = "none";
 
-  for (let index = 0; index < totalBars; index++) {
-    const mirroredIndex = index < halfBars ? halfBars - 1 - index : index - halfBars;
-    const centeredProgress = mirroredIndex / Math.max(halfBars - 1, 1);
-    const compressedProgress = 0.5 + (centeredProgress - 0.5) * widthFactor;
-    const sourceProgress = Math.max(0, Math.min(1, compressedProgress));
-    const sourceIndex = Math.floor(sourceProgress * (audioSpectrum.length - 1));
-    const band = Math.max(0, Math.min(1, audioSpectrum[sourceIndex] ?? 0));
-    const normalizedBand = Math.max(0, (band - noiseFloor) / (1 - noiseFloor));
-    const centerDistance =
-      Math.abs(index - (totalBars - 1) / 2) / ((totalBars - 1) / 2);
-    const centerEnvelope =
-      sideFloor + (1 - centerDistance) ** centerEnvelopePower * (1 - sideFloor);
-    const gainWeight = (1 - centerDistance) ** centerEnvelopePower;
-    const gain = edgeGain + (centerGain - edgeGain) * gainWeight;
-    const shapedBand =
-      normalizedBand * sideMotionMix + normalizedBand * centerEnvelope * (1 - sideMotionMix);
-    const effectiveBand = Math.max(0, Math.min(1, shapedBand * gain));
-    const bell = 1 + style.bellBoost * (1 - centerDistance) ** 6;
-    const barHeight = Math.min(
-      waveRect.height * 1.65,
-      Math.max(0, effectiveBand * waveRect.height * bell * style.verticalGain),
+  for (let index = 0; index < bars.length; index += 1) {
+    const bar = bars[index];
+    const barHeight = getWaveformRenderedBarHeight(
+      bar?.heightRatio ?? 0,
+      overlayHeight,
+      waveformAmplitudeScale,
+      barWidth,
     );
+    const renderedBarWidth = getWaveformRenderedBarWidth(
+      barHeight,
+      barWidth,
+    );
+    const opacity = bar
+      ? getWaveformBarLayerOpacities(bar).sharpOpacity *
+        getWaveformRenderedBarOpacityScale(
+          bar.heightRatio,
+          overlayHeight,
+          waveformAmplitudeScale,
+          barWidth,
+        )
+      : 0;
+    const centerOffset = bar
+      ? getWaveformRenderedBarCenterOffset(
+          bar.centerOffsetRatio,
+          overlayHeight,
+          waveformAmplitudeScale,
+        )
+      : 0;
 
-    if (barHeight <= 0) {
+    if (
+      barHeight <= 0 ||
+      renderedBarWidth <= 0 ||
+      opacity <= 0
+    ) {
       continue;
     }
 
-    const x = startX + index * (barWidth + gap);
-    const y = waveRect.y + (waveRect.height - barHeight) / 2;
-    const radius = Math.min(barWidth / 2, 5 * scaleX);
-    context.globalAlpha = getWaveformBarOpacity(mirroredIndex);
-    drawRoundedRect(context, x, y, barWidth, barHeight, radius);
-    context.fill();
-  }
-
-  context.globalAlpha = 1;
-}
-
-function drawVisibleLogo(
-  context: CanvasRenderingContext2D,
-  frameElement: HTMLElement,
-  topLogoImage: HTMLImageElement,
-) {
-  const logoElement = frameElement.querySelector<HTMLElement>(".scene-logo");
-
-  if (!logoElement) {
-    return;
-  }
-
-  const rect = getExportRect(logoElement, frameElement, context.canvas.width, context.canvas.height);
-  context.globalAlpha = 1;
-  context.filter = "none";
-  context.drawImage(topLogoImage, rect.x, rect.y, rect.width, rect.height);
-}
-
-function drawVisibleCenterOverlay(
-  context: CanvasRenderingContext2D,
-  frameElement: HTMLElement,
-) {
-  const overlayElement = frameElement.querySelector<HTMLElement>(".visual-overlay");
-  const imageElement = frameElement.querySelector<HTMLImageElement>(".visual-overlay-mark");
-
-  if (
-    !overlayElement ||
-    !imageElement ||
-    !imageElement.complete ||
-    imageElement.naturalWidth <= 0
-  ) {
-    return false;
-  }
-
-  const rect = getExportRect(overlayElement, frameElement, context.canvas.width, context.canvas.height);
-  context.globalAlpha = 1;
-  context.filter = "none";
-  context.drawImage(imageElement, rect.x, rect.y, rect.width, rect.height);
-
-  return true;
-}
-
-function drawVisibleBottomContent(
-  context: CanvasRenderingContext2D,
-  frameElement: HTMLElement,
-) {
-  const sloganElements = Array.from(frameElement.querySelectorAll<HTMLElement>(".scene-bottom-slogan"));
-  const buttonElement = frameElement.querySelector<HTMLElement>(".scene-demo-button");
-  const qrElement = frameElement.querySelector<HTMLImageElement>(".scene-qr-code");
-
-  sloganElements.forEach((sloganElement) => {
-    const sloganStyle = getComputedStyle(sloganElement);
-    const sloganColor = sloganStyle.color || "#ffffff";
-    const wordElements = Array.from(sloganElement.querySelectorAll<HTMLElement>(".scene-slogan-word"));
-    const align = sloganElement.dataset.align === "right" ? "right" : "left";
-
-    context.fillStyle = sloganColor;
-    context.textAlign = align;
-    context.textBaseline = "top";
-    setCanvasFontFromStyle(context, sloganStyle, frameElement, "300");
-    setCanvasLetterSpacing(context, sloganStyle, frameElement);
-
-    wordElements.forEach((wordElement) => {
-      const rect = getExportRect(wordElement, frameElement, context.canvas.width, context.canvas.height);
-      context.fillText(wordElement.textContent ?? "", align === "right" ? rect.x + rect.width : rect.x, rect.y);
-    });
-
-    setCanvasLetterSpacing(context, null, frameElement);
-  });
-
-  if (buttonElement) {
-    const rect = getExportRect(buttonElement, frameElement, context.canvas.width, context.canvas.height);
-    const buttonStyle = getComputedStyle(buttonElement);
-    const radius = rect.height / 2;
-    const blurRadius = Math.max(6, Math.min(context.canvas.width, context.canvas.height) * 0.012);
-
-    drawBlurredBackdrop(context, rect.x, rect.y, rect.width, rect.height, radius, blurRadius);
-    context.fillStyle = buttonStyle.backgroundColor || "rgba(255,255,255,0.25)";
-    context.globalAlpha = 1;
-    drawRoundedRect(context, rect.x, rect.y, rect.width, rect.height, radius);
-    context.fill();
-
-    context.fillStyle = buttonStyle.color || "#ffffff";
-    context.textAlign = "center";
-    context.textBaseline = "middle";
-    setCanvasFontFromStyle(context, buttonStyle, frameElement);
-    setCanvasLetterSpacing(context, buttonStyle, frameElement);
-    context.fillText(
-      buttonElement.textContent?.trim() ?? "",
-      rect.x + rect.width / 2,
-      rect.y + rect.height / 2,
+    const x =
+      left +
+      getWaveformBarOffset(index, barStep, barPixelScale) +
+      barCenterInset -
+      renderedBarWidth / 2;
+    const y =
+      top + (overlayHeight - barHeight) / 2 + centerOffset;
+    drawWaveformCoreBar(
+      context,
+      x,
+      y,
+      renderedBarWidth,
+      barHeight,
+      color,
+      opacity,
     );
-    setCanvasLetterSpacing(context, null, frameElement);
   }
 
-  if (qrElement && qrElement.complete && qrElement.naturalWidth > 0) {
-    const rect = getExportRect(qrElement, frameElement, context.canvas.width, context.canvas.height);
-    context.globalAlpha = 1;
-    context.filter = "none";
-    context.drawImage(qrElement, rect.x, rect.y, rect.width, rect.height);
-  }
+  context.globalAlpha = 1;
+  context.filter = "none";
 }
 
-function setCanvasFontFromStyle(
+function drawWaveformGlowLayer(
   context: CanvasRenderingContext2D,
-  style: CSSStyleDeclaration,
-  frameElement: HTMLElement,
-  fontWeight?: string,
+  bars: ReturnType<typeof createWaveformBars>,
+  color: string,
+  frameWidth: number,
+  frameHeight: number,
+  left: number,
+  centerY: number,
+  overlayWidth: number,
+  overlayHeight: number,
+  amplitudeScale: number,
+  barWidth: number,
+  barCenterInset: number,
+  barStep: number,
+  barPixelScale: number,
+  edgeBlurRadius: number,
+  glowBlurRadius: number,
 ) {
-  const frameRect = frameElement.getBoundingClientRect();
-  const scaleY = context.canvas.height / Math.max(frameRect.height, 1);
-  const fontSize = Math.max(1, parseFloat(style.fontSize || "16") * scaleY);
-  context.font = `${style.fontStyle || "normal"} ${style.fontVariant || "normal"} ${
-    fontWeight ?? style.fontWeight ?? "400"
-  } ${fontSize}px ${style.fontFamily || "sans-serif"}`;
-}
-
-function setCanvasLetterSpacing(
-  context: CanvasRenderingContext2D,
-  style: CSSStyleDeclaration | null,
-  frameElement: HTMLElement,
-) {
-  const writableContext = context as CanvasRenderingContext2D & {
-    letterSpacing?: string;
-  };
-
-  if (typeof writableContext.letterSpacing !== "string") {
+  if (glowBlurRadius <= 0) {
     return;
   }
 
-  if (!style) {
-    writableContext.letterSpacing = "0px";
+  const maxGlowHeight = getWaveformMaxPeakHeight(
+    frameWidth,
+    frameHeight,
+    edgeBlurRadius,
+  );
+  const pad = Math.ceil(glowBlurRadius * 3);
+  const layerLeft = Math.floor(left - pad);
+  const layerTop = Math.floor(centerY - maxGlowHeight / 2 - pad);
+  const layerRight = Math.ceil(left + overlayWidth + pad);
+  const layerBottom = Math.ceil(centerY + maxGlowHeight / 2 + pad);
+  const layerWidth = Math.max(1, layerRight - layerLeft);
+  const layerHeight = Math.max(1, layerBottom - layerTop);
+  let layer = waveformGlowLayerCache.get(context);
+
+  if (!layer) {
+    const canvas = document.createElement("canvas");
+    const layerContext = canvas.getContext("2d");
+
+    if (!layerContext) {
+      return;
+    }
+
+    const sprite = document.createElement("canvas");
+    sprite.width = 8;
+    sprite.height = 256;
+    layer = { canvas, color: "", context: layerContext, sprite };
+    waveformGlowLayerCache.set(context, layer);
+  }
+
+  const { canvas, context: layerContext, sprite } = layer;
+
+  if (canvas.width !== layerWidth || canvas.height !== layerHeight) {
+    canvas.width = layerWidth;
+    canvas.height = layerHeight;
+  }
+
+  layerContext.setTransform(1, 0, 0, 1, 0, 0);
+  layerContext.clearRect(0, 0, layerWidth, layerHeight);
+  layerContext.filter = "none";
+  layerContext.globalCompositeOperation = "source-over";
+
+  if (layer.color !== color) {
+    const spriteContext = sprite.getContext("2d");
+
+    if (!spriteContext) {
+      return;
+    }
+
+    const gradient = spriteContext.createLinearGradient(
+      0,
+      0,
+      0,
+      sprite.height,
+    );
+
+    gradient.addColorStop(0, "transparent");
+    gradient.addColorStop(0.08, colorWithAlpha(color, 0.15625));
+    gradient.addColorStop(0.16, colorWithAlpha(color, 0.5));
+    gradient.addColorStop(0.24, colorWithAlpha(color, 0.84375));
+    gradient.addColorStop(0.32, color);
+    gradient.addColorStop(0.68, color);
+    gradient.addColorStop(0.76, colorWithAlpha(color, 0.84375));
+    gradient.addColorStop(0.84, colorWithAlpha(color, 0.5));
+    gradient.addColorStop(0.92, colorWithAlpha(color, 0.15625));
+    gradient.addColorStop(1, "transparent");
+    spriteContext.clearRect(0, 0, sprite.width, sprite.height);
+    spriteContext.fillStyle = gradient;
+    spriteContext.fillRect(0, 0, sprite.width, sprite.height);
+    layer.color = color;
+  }
+
+  for (let index = 0; index < bars.length; index += 1) {
+    const bar = bars[index];
+    const barHeight = getWaveformRenderedBarHeight(
+      bar.heightRatio,
+      overlayHeight,
+      amplitudeScale,
+      barWidth,
+    );
+    const renderedBarWidth = getWaveformRenderedBarWidth(
+      barHeight,
+      barWidth,
+    );
+    const activityOpacity = getWaveformRenderedBarOpacityScale(
+      bar.heightRatio,
+      overlayHeight,
+      amplitudeScale,
+      barWidth,
+    );
+    const glowHeight = getWaveformGlowHeight(
+      barHeight,
+      overlayHeight,
+      activityOpacity,
+      maxGlowHeight,
+    );
+    const opacity = getWaveformBarGlowOpacity(
+      bar,
+      activityOpacity,
+    );
+    const centerOffset = getWaveformRenderedBarCenterOffset(
+      bar.centerOffsetRatio,
+      overlayHeight,
+      amplitudeScale,
+    );
+
+    if (
+      glowHeight <= 0 ||
+      renderedBarWidth <= 0 ||
+      opacity <= 0
+    ) {
+      continue;
+    }
+
+    const x =
+      left +
+      getWaveformBarOffset(index, barStep, barPixelScale) +
+      barCenterInset -
+      renderedBarWidth / 2 -
+      layerLeft;
+    const y =
+      centerY + centerOffset - glowHeight / 2 - layerTop;
+    layerContext.globalAlpha = opacity;
+    layerContext.drawImage(
+      sprite,
+      x,
+      y,
+      renderedBarWidth,
+      glowHeight,
+    );
+  }
+
+  layerContext.globalAlpha = 1;
+  context.save();
+  context.globalAlpha = 1;
+  context.filter = `blur(${glowBlurRadius}px)`;
+  context.drawImage(canvas, layerLeft, layerTop);
+  context.restore();
+}
+
+function colorWithAlpha(color: string, alpha: number) {
+  const normalized = color.replace("#", "");
+  const red = Number.parseInt(normalized.slice(0, 2), 16);
+  const green = Number.parseInt(normalized.slice(2, 4), 16);
+  const blue = Number.parseInt(normalized.slice(4, 6), 16);
+  const safeAlpha = Math.max(0, Math.min(1, alpha));
+
+  return `rgb(${red} ${green} ${blue} / ${safeAlpha})`;
+}
+
+function drawWaveformCoreBar(
+  context: CanvasRenderingContext2D,
+  x: number,
+  y: number,
+  width: number,
+  height: number,
+  color: string,
+  opacity: number,
+) {
+  context.fillStyle = color;
+  context.globalAlpha = opacity;
+  drawRoundedRect(
+    context,
+    x,
+    y,
+    width,
+    height,
+    width / 2,
+  );
+  context.fill();
+}
+
+function drawWaveformBlurLayer(
+  context: CanvasRenderingContext2D,
+  bars: ReturnType<typeof createWaveformBars>,
+  color: string,
+  frameWidth: number,
+  frameHeight: number,
+  left: number,
+  centerY: number,
+  overlayWidth: number,
+  overlayHeight: number,
+  amplitudeScale: number,
+  barWidth: number,
+  barCenterInset: number,
+  barStep: number,
+  barPixelScale: number,
+  blurRadius: number,
+) {
+  const maxBarHeight = bars.reduce(
+    (peak, bar) =>
+      Math.max(
+        peak,
+        getWaveformRenderedBarHeight(
+          bar.heightRatio,
+          overlayHeight,
+          amplitudeScale,
+          barWidth,
+        ),
+      ),
+    0,
+  );
+
+  if (maxBarHeight <= 0 || blurRadius <= 0) {
     return;
   }
 
-  const frameRect = frameElement.getBoundingClientRect();
-  const scaleX = context.canvas.width / Math.max(frameRect.width, 1);
-  const letterSpacing = parseFloat(style.letterSpacing || "0");
-  writableContext.letterSpacing = Number.isFinite(letterSpacing)
-    ? `${letterSpacing * scaleX}px`
-    : "0px";
+  const pad = Math.ceil(blurRadius * 3);
+  const maxSafeBarHeight = getWaveformMaxPeakHeight(
+    frameWidth,
+    frameHeight,
+    blurRadius,
+  );
+  const layerLeft = Math.floor(left - pad);
+  const layerTop = Math.floor(centerY - maxSafeBarHeight / 2 - pad);
+  const layerRight = Math.ceil(left + overlayWidth + pad);
+  const layerBottom = Math.ceil(centerY + maxSafeBarHeight / 2 + pad);
+  const layerWidth = Math.max(1, layerRight - layerLeft);
+  const layerHeight = Math.max(1, layerBottom - layerTop);
+  let layer = waveformBlurLayerCache.get(context);
+
+  if (!layer) {
+    const canvas = document.createElement("canvas");
+    const layerContext = canvas.getContext("2d");
+
+    if (!layerContext) {
+      return;
+    }
+
+    layer = { canvas, context: layerContext };
+    waveformBlurLayerCache.set(context, layer);
+  }
+
+  const { canvas, context: layerContext } = layer;
+
+  if (canvas.width !== layerWidth || canvas.height !== layerHeight) {
+    canvas.width = layerWidth;
+    canvas.height = layerHeight;
+  }
+
+  layerContext.setTransform(1, 0, 0, 1, 0, 0);
+  layerContext.clearRect(0, 0, layerWidth, layerHeight);
+  layerContext.filter = "none";
+  layerContext.fillStyle = color;
+  layerContext.globalCompositeOperation = "source-over";
+
+  for (let index = 0; index < bars.length; index += 1) {
+    const bar = bars[index];
+    const barHeight = getWaveformRenderedBarHeight(
+      bar.heightRatio,
+      overlayHeight,
+      amplitudeScale,
+      barWidth,
+    );
+    const renderedBarWidth = getWaveformRenderedBarWidth(
+      barHeight,
+      barWidth,
+    );
+    const opacity =
+      getWaveformBarLayerOpacities(bar).blurOpacity *
+      getWaveformRenderedBarOpacityScale(
+        bar.heightRatio,
+        overlayHeight,
+        amplitudeScale,
+        barWidth,
+      );
+    const centerOffset = getWaveformRenderedBarCenterOffset(
+      bar.centerOffsetRatio,
+      overlayHeight,
+      amplitudeScale,
+    );
+
+    if (
+      barHeight <= 0 ||
+      renderedBarWidth <= 0 ||
+      opacity <= 0
+    ) {
+      continue;
+    }
+
+    const x =
+      left +
+      getWaveformBarOffset(index, barStep, barPixelScale) -
+      layerLeft +
+      barCenterInset -
+      renderedBarWidth / 2;
+    const y =
+      centerY + centerOffset - barHeight / 2 - layerTop;
+    drawWaveformCoreBar(
+      layerContext,
+      x,
+      y,
+      renderedBarWidth,
+      barHeight,
+      color,
+      opacity,
+    );
+  }
+
+  layerContext.globalAlpha = 1;
+  context.save();
+  context.globalAlpha = 1;
+  context.filter = `blur(${blurRadius}px)`;
+  context.drawImage(canvas, layerLeft, layerTop);
+  context.restore();
 }
 
 function getSceneWaveBounds(
   width: number,
   height: number,
   waveformStyle: WaveformStyle = getWaveformStyle(),
+  peakHeightRatio = 0,
+  edgeBlurRadius = 0,
+  pixelScale = 1,
 ) {
-  const ratio = width / height;
-  const isSquare = Math.abs(ratio - 1) < 0.01;
-  const isThreeByFour = Math.abs(ratio - 3 / 4) < 0.01;
-  const isNineBySixteen = Math.abs(ratio - 9 / 16) < 0.01;
-
-  const waveformBoxScale = isSquare
-    ? 0.757576
-    : isThreeByFour
-      ? 0.984848
-      : isNineBySixteen
-        ? 0.738636
-        : 1;
-  const overlayWidth =
-    isSquare || isThreeByFour || isNineBySixteen
-      ? width * 0.5 * waveformBoxScale * waveformStyle.boxScale
-      : width * 0.78 * waveformStyle.boxScale;
-  const overlayHeight =
-    isSquare || isThreeByFour || isNineBySixteen
-      ? height * 0.32 * waveformBoxScale * waveformStyle.boxScale
-      : height * 0.32 * waveformStyle.boxScale;
+  const geometry = getWaveformGeometry(
+    width,
+    height,
+    waveformStyle.boxScale,
+    pixelScale,
+  );
 
   return {
-    amplitudeScale: focusedWaveformAmplitudeScale,
-    height: overlayHeight,
-    width: overlayWidth,
+    amplitudeScale: getWaveformAmplitudeScale(
+      width,
+      height,
+      geometry.height,
+      peakHeightRatio,
+      WAVEFORM_AMPLITUDE_SCALE,
+      edgeBlurRadius,
+    ),
+    ...geometry,
   };
-}
-
-function getWaveformBarOpacity(distanceFromCenterBar: number) {
-  return Math.max(0, 1 - distanceFromCenterBar * 0.05);
 }
 
 function drawSceneBottomBar(
@@ -4407,7 +5420,7 @@ function drawSceneBottomBar(
       : isSquare
         ? 1.32
         : 1;
-  const margin = Math.round(sizeUnit * 0.06);
+  const margin = getSceneHorizontalPadding(width);
   const logoTop = Math.round(sizeUnit * (isNineBySixteen ? 0.13125 : 0.075));
 
   context.save();
@@ -4502,16 +5515,36 @@ function drawBlurredBackdrop(
     return;
   }
 
-  const snapshot = document.createElement("canvas");
-  snapshot.width = sw;
-  snapshot.height = sh;
-  const snapshotContext = snapshot.getContext("2d");
+  let cachedSnapshot = blurredBackdropCache.get(context);
 
-  if (!snapshotContext) {
-    return;
+  if (!cachedSnapshot) {
+    const canvas = document.createElement("canvas");
+    const snapshotContext = canvas.getContext("2d");
+
+    if (!snapshotContext) {
+      return;
+    }
+
+    cachedSnapshot = {
+      canvas,
+      context: snapshotContext,
+    };
+    blurredBackdropCache.set(context, cachedSnapshot);
   }
 
+  const { canvas: snapshot, context: snapshotContext } = cachedSnapshot;
+
+  if (snapshot.width !== sw || snapshot.height !== sh) {
+    snapshot.width = sw;
+    snapshot.height = sh;
+  }
+
+  snapshotContext.clearRect(0, 0, sw, sh);
+  snapshotContext.filter = "none";
+  snapshotContext.globalAlpha = 1;
+  snapshotContext.globalCompositeOperation = "copy";
   snapshotContext.drawImage(context.canvas, sx, sy, sw, sh, 0, 0, sw, sh);
+  snapshotContext.globalCompositeOperation = "source-over";
   context.save();
   drawRoundedRect(context, x, y, width, height, radius);
   context.clip();
@@ -4641,90 +5674,6 @@ function downloadDataUrl(dataUrl: string, filename: string) {
   link.click();
 }
 
-function downloadBlob(blob: Blob, filename: string) {
-  const url = URL.createObjectURL(blob);
-  const link = document.createElement("a");
-
-  link.download = filename;
-  link.href = url;
-  document.body.appendChild(link);
-  link.click();
-  link.remove();
-  window.setTimeout(() => URL.revokeObjectURL(url), 60_000);
-}
-
-async function createZipBlob(files: Array<{ blob: Blob; filename: string }>) {
-  const encoder = new TextEncoder();
-  const localParts: BlobPart[] = [];
-  const centralParts: BlobPart[] = [];
-  let localOffset = 0;
-
-  for (const file of files) {
-    const filename = encoder.encode(file.filename);
-    const bytes = new Uint8Array(await file.blob.arrayBuffer());
-    const checksum = crc32(bytes);
-    const localHeader = new Uint8Array(30 + filename.length);
-    const localView = new DataView(localHeader.buffer);
-    localView.setUint32(0, 0x04034b50, true);
-    localView.setUint16(4, 20, true);
-    localView.setUint16(6, 0x0800, true);
-    localView.setUint32(14, checksum, true);
-    localView.setUint32(18, bytes.length, true);
-    localView.setUint32(22, bytes.length, true);
-    localView.setUint16(26, filename.length, true);
-    localHeader.set(filename, 30);
-    localParts.push(localHeader, bytes);
-
-    const centralHeader = new Uint8Array(46 + filename.length);
-    const centralView = new DataView(centralHeader.buffer);
-    centralView.setUint32(0, 0x02014b50, true);
-    centralView.setUint16(4, 20, true);
-    centralView.setUint16(6, 20, true);
-    centralView.setUint16(8, 0x0800, true);
-    centralView.setUint32(16, checksum, true);
-    centralView.setUint32(20, bytes.length, true);
-    centralView.setUint32(24, bytes.length, true);
-    centralView.setUint16(28, filename.length, true);
-    centralView.setUint32(42, localOffset, true);
-    centralHeader.set(filename, 46);
-    centralParts.push(centralHeader);
-    localOffset += localHeader.length + bytes.length;
-  }
-
-  const centralSize = centralParts.reduce((total, part) => total + (part as Uint8Array).length, 0);
-  const endRecord = new Uint8Array(22);
-  const endView = new DataView(endRecord.buffer);
-  endView.setUint32(0, 0x06054b50, true);
-  endView.setUint16(8, files.length, true);
-  endView.setUint16(10, files.length, true);
-  endView.setUint32(12, centralSize, true);
-  endView.setUint32(16, localOffset, true);
-
-  return new Blob([...localParts, ...centralParts, endRecord], { type: "application/zip" });
-}
-
-function crc32(bytes: Uint8Array) {
-  let crc = 0xffffffff;
-
-  for (const byte of bytes) {
-    crc ^= byte;
-    for (let bit = 0; bit < 8; bit += 1) {
-      crc = (crc >>> 1) ^ (0xedb88320 & -(crc & 1));
-    }
-  }
-
-  return (crc ^ 0xffffffff) >>> 0;
-}
-
-function getSupportedVideoMimeType(videoFormat: VideoExportFormat) {
-  const mimeTypes =
-    videoFormat === "mp4"
-      ? ["video/mp4;codecs=h264", "video/mp4;codecs=avc1.42E01E", "video/mp4"]
-      : ["video/webm;codecs=vp9", "video/webm;codecs=vp8", "video/webm"];
-
-  return mimeTypes.find((mimeType) => MediaRecorder.isTypeSupported(mimeType)) ?? "";
-}
-
 function getCompressedVideoBitrate(
   formatToExport: FormatConfig,
   preset: VideoBitratePreset,
@@ -4750,14 +5699,14 @@ function slugify(value: string) {
     .replace(/^-|-$/g, "");
 }
 
-async function readGalleryState(): Promise<GalleryState> {
-  const apiGalleryState = await fetchGalleryState(galleryApiPath);
+async function readGalleryState(): Promise<GalleryDocument> {
+  const apiGalleryState = await fetchGalleryState(galleryApiPath, true);
 
   if (apiGalleryState) {
     return apiGalleryState;
   }
 
-  const staticGalleryState = await fetchGalleryState(staticGalleryPath);
+  const staticGalleryState = await fetchGalleryState(staticGalleryPath, false);
 
   if (staticGalleryState) {
     return staticGalleryState;
@@ -4766,27 +5715,94 @@ async function readGalleryState(): Promise<GalleryState> {
   throw new Error("Gallery file could not be loaded.");
 }
 
-async function writeGalleryState(state: GalleryState): Promise<void> {
-  try {
-    const response = await fetch(galleryApiPath, {
-      body: JSON.stringify(state),
-      headers: { "Content-Type": "application/json" },
-      method: "PUT",
-    });
+async function writeGalleryState(
+  state: GalleryState,
+  revision: string | null,
+  baseState: GalleryState,
+): Promise<GalleryWriteResult> {
+  let nextState = state;
+  let nextRevision = revision;
+  let nextBaseState = baseState;
 
-    if (response.ok) {
-      return;
-    }
-  } catch {
-    // Static hosts such as GitHub Pages cannot write to /api/gallery.
+  if (nextRevision === null) {
+    writeLegacyGalleryState(nextState);
+    return { revision: null, state: nextState };
   }
 
-  writeLegacyGalleryState(state);
+  for (let attempt = 0; attempt < galleryConflictRetryLimit; attempt += 1) {
+    let response: Response;
+
+    try {
+      response = await fetch(galleryApiPath, {
+        body: JSON.stringify(nextState),
+        headers: {
+          Accept: "application/json",
+          "Content-Type": "application/json",
+          "If-Match": nextRevision,
+        },
+        method: "PUT",
+      });
+    } catch {
+      throw new Error("Gallery server could not be reached.");
+    }
+
+    if (response.ok) {
+      const savedRevision = response.headers.get("ETag");
+
+      if (!savedRevision) {
+        throw new Error("Gallery server did not return a revision.");
+      }
+
+      const responseBody = await readJsonResponse(response);
+      const savedState =
+        isRecord(responseBody) && isGalleryStatePayload(responseBody.state)
+          ? normalizeGalleryState(responseBody.state)
+          : nextState;
+
+      return { revision: savedRevision, state: savedState };
+    }
+
+    if (response.status !== 409) {
+      const responseBody = await readJsonResponse(response);
+      const message =
+        isRecord(responseBody) && typeof responseBody.error === "string"
+          ? responseBody.error
+          : `Gallery save failed with status ${response.status}.`;
+
+      throw new Error(message);
+    }
+
+    const conflictBody = await readJsonResponse(response);
+    const remoteRevision = response.headers.get("ETag");
+    const remoteStateValue =
+      isRecord(conflictBody) && "state" in conflictBody
+        ? conflictBody.state
+        : null;
+
+    if (!remoteRevision || !isGalleryStatePayload(remoteStateValue)) {
+      throw new Error("Gallery conflict response was invalid.");
+    }
+
+    const remoteState = normalizeGalleryState(remoteStateValue);
+    nextState = mergeConcurrentGalleryStates(
+      nextBaseState,
+      nextState,
+      remoteState,
+    );
+    nextBaseState = remoteState;
+    nextRevision = remoteRevision;
+  }
+
+  throw new Error("Gallery changed repeatedly while it was being saved.");
 }
 
-async function fetchGalleryState(path: string): Promise<GalleryState | null> {
+async function fetchGalleryState(
+  path: string,
+  requiresRevision: boolean,
+): Promise<GalleryDocument | null> {
   try {
     const response = await fetch(path, {
+      cache: "no-store",
       headers: { Accept: "application/json" },
     });
 
@@ -4794,7 +5810,25 @@ async function fetchGalleryState(path: string): Promise<GalleryState | null> {
       return null;
     }
 
-    return normalizeGalleryState(await response.json());
+    const value = await response.json();
+    const revision = requiresRevision ? response.headers.get("ETag") : null;
+
+    if (!isGalleryStatePayload(value) || (requiresRevision && !revision)) {
+      return null;
+    }
+
+    return {
+      revision,
+      state: normalizeGalleryState(value),
+    };
+  } catch {
+    return null;
+  }
+}
+
+async function readJsonResponse(response: Response): Promise<unknown> {
+  try {
+    return await response.json();
   } catch {
     return null;
   }
@@ -4859,6 +5893,93 @@ function mergeGalleryStates(
   ];
 
   return normalizeGalleryState({ items, sections });
+}
+
+function mergeConcurrentGalleryStates(
+  baseState: GalleryState,
+  localState: GalleryState,
+  remoteState: GalleryState,
+): GalleryState {
+  const baseSections = new Map(
+    baseState.sections.map((section) => [section.id, section]),
+  );
+  const remoteSections = new Map(
+    remoteState.sections.map((section) => [section.id, section]),
+  );
+  const mergedSections: GallerySection[] = [];
+  const mergedSectionIds = new Set<string>();
+
+  localState.sections.forEach((localSection) => {
+    if (mergedSectionIds.has(localSection.id)) {
+      return;
+    }
+
+    const baseSection = baseSections.get(localSection.id);
+    const remoteSection = remoteSections.get(localSection.id);
+    const mergedSection =
+      baseSection && remoteSection
+        ? {
+            ...remoteSection,
+            isOpen:
+              localSection.isOpen !== baseSection.isOpen
+                ? localSection.isOpen
+                : remoteSection.isOpen,
+            name:
+              localSection.name !== baseSection.name
+                ? localSection.name
+                : remoteSection.name,
+          }
+        : localSection;
+
+    mergedSections.push(mergedSection);
+    mergedSectionIds.add(mergedSection.id);
+  });
+
+  remoteState.sections.forEach((remoteSection) => {
+    if (!mergedSectionIds.has(remoteSection.id)) {
+      mergedSections.push(remoteSection);
+      mergedSectionIds.add(remoteSection.id);
+    }
+  });
+
+  const baseItems = new Map(baseState.items.map((item) => [item.id, item]));
+  const remoteItems = new Map(remoteState.items.map((item) => [item.id, item]));
+  const mergedItems: VisualSnapshot[] = [];
+  const mergedItemIds = new Set<string>();
+
+  localState.items.forEach((localItem) => {
+    if (mergedItemIds.has(localItem.id)) {
+      return;
+    }
+
+    const baseItem = baseItems.get(localItem.id);
+    const remoteItem = remoteItems.get(localItem.id);
+    const mergedItem =
+      baseItem && remoteItem
+        ? {
+            ...remoteItem,
+            sectionId:
+              localItem.sectionId !== baseItem.sectionId
+                ? localItem.sectionId
+                : remoteItem.sectionId,
+          }
+        : localItem;
+
+    mergedItems.push(mergedItem);
+    mergedItemIds.add(mergedItem.id);
+  });
+
+  remoteState.items.forEach((remoteItem) => {
+    if (!mergedItemIds.has(remoteItem.id)) {
+      mergedItems.push(remoteItem);
+      mergedItemIds.add(remoteItem.id);
+    }
+  });
+
+  return normalizeGalleryState({
+    items: mergedItems,
+    sections: mergedSections,
+  });
 }
 
 function hasGalleryContent(state: GalleryState) {
@@ -4959,6 +6080,7 @@ function normalizeGalleryItem(
     typeof value.sectionId === "string" && sectionIds.has(value.sectionId)
       ? value.sectionId
       : fallbackSectionId;
+  const renderVersion = value.renderVersion === 2 ? 2 : 1;
 
   if (
     typeof value.id !== "string" ||
@@ -4979,9 +6101,17 @@ function normalizeGalleryItem(
     ),
     format: value.format as FormatConfig,
     id: value.id,
-    mesh: normalizeMesh(value.mesh as MeshConfig),
+    // Unversioned gallery items were authored against the legacy 0–500k
+    // timeline and were always clamped on load. Preserve that phase exactly,
+    // while version 2 snapshots retain the unbounded timeline.
+    mesh: applyPresetAudioDefaults(
+      renderVersion === 2
+        ? normalizeRenderMesh(value.mesh as MeshConfig)
+        : normalizeMesh(value.mesh as MeshConfig),
+    ),
     name: value.name,
     overlay: normalizeOverlay(value.overlay),
+    renderVersion,
     sectionId,
     thumbnail: value.thumbnail,
   };
@@ -5070,39 +6200,32 @@ function isRecord(value: unknown): value is Record<string, unknown> {
   return typeof value === "object" && value !== null;
 }
 
-function finiteNumber(value: unknown, fallback: number) {
-  return typeof value === "number" && Number.isFinite(value) ? value : fallback;
+function isGalleryStatePayload(
+  value: unknown,
+): value is { items: unknown[]; sections: unknown[] } {
+  return (
+    isRecord(value) &&
+    Array.isArray(value.items) &&
+    Array.isArray(value.sections)
+  );
 }
 
-function getWaveformStyle(overrides: Partial<WaveformStyle> = {}): WaveformStyle {
-  return {
-    bellBoost: 1.2,
-    boxScale: 1,
-    centerEnvelopePower: 3,
-    centerGain: 1.5,
-    edgeGain: 1,
-    noiseFloor: 0.02,
-    sideFloor: 0.06,
-    sideMotionMix: 0.05,
-    useStarProfile: false,
-    verticalGain: 1.0,
-    widthFactor: 1,
-    ...overrides,
-  };
+function finiteNumber(value: unknown, fallback: number) {
+  return typeof value === "number" && Number.isFinite(value) ? value : fallback;
 }
 
 function createRandomWaveformStyle(): WaveformStyle {
   const profiles = [
     () => getWaveformStyle({
-      bellBoost: randomBetween(2.4, 4.2),
+      bellBoost: randomBetween(1.2, 2),
       boxScale: randomBetween(0.82, 1.08),
-      centerEnvelopePower: randomBetween(2.8, 6.2),
-      centerGain: randomBetween(2.2, 4.6),
-      edgeGain: randomBetween(0.25, 0.78),
+      centerEnvelopePower: randomBetween(2.4, 4),
+      centerGain: randomBetween(2, 3.8),
+      edgeGain: randomBetween(0.35, 0.8),
       noiseFloor: randomBetween(0, 0.045),
       sideFloor: randomBetween(0.02, 0.14),
       sideMotionMix: randomBetween(0, 0.14),
-      verticalGain: randomBetween(1.35, 2.75),
+      verticalGain: randomBetween(1.2, 2.3),
       widthFactor: randomBetween(0.56, 0.9),
     }),
     () => getWaveformStyle({
@@ -5118,7 +6241,7 @@ function createRandomWaveformStyle(): WaveformStyle {
       widthFactor: randomBetween(1.02, 1.45),
     }),
     () => getWaveformStyle({
-      bellBoost: randomBetween(1.5, 3.5),
+      bellBoost: randomBetween(0.8, 1.8),
       boxScale: randomBetween(0.9, 1.18),
       centerEnvelopePower: randomBetween(1.2, 2.8),
       centerGain: randomBetween(1.55, 3.25),
@@ -5130,70 +6253,21 @@ function createRandomWaveformStyle(): WaveformStyle {
       widthFactor: randomBetween(0.78, 1.22),
     }),
     () => getWaveformStyle({
-      bellBoost: randomBetween(3.0, 5.0),
+      bellBoost: randomBetween(1.5, 2),
       boxScale: randomBetween(0.76, 1.06),
-      centerEnvelopePower: randomBetween(5.2, 9.0),
-      centerGain: randomBetween(2.6, 5.4),
+      centerEnvelopePower: randomBetween(3.2, 4),
+      centerGain: randomBetween(2.4, 4),
       edgeGain: randomBetween(0.18, 0.62),
       noiseFloor: randomBetween(0.015, 0.08),
       sideFloor: randomBetween(0, 0.08),
       sideMotionMix: randomBetween(0, 0.08),
-      verticalGain: randomBetween(1.55, 3.15),
+      verticalGain: randomBetween(1.4, 2.5),
       widthFactor: randomBetween(0.7, 1.12),
     }),
   ];
   const profile = profiles[Math.floor(Math.random() * profiles.length)] ?? profiles[0];
 
   return profile();
-}
-
-function sampleSpectrumLevels(
-  levels: Uint8Array,
-  sampleRate: number,
-  bandCount: number,
-  minFrequency: number,
-  maxFrequency: number,
-) {
-  const nyquist = sampleRate / 2;
-  const clampedMaxFrequency = Math.min(maxFrequency, nyquist);
-  const clampedMinFrequency = Math.max(1, Math.min(minFrequency, clampedMaxFrequency));
-
-  return Array.from({ length: bandCount }, (_, index) => {
-    const startFrequency = frequencyAtBand(
-      index / bandCount,
-      clampedMinFrequency,
-      clampedMaxFrequency,
-    );
-    const endFrequency = frequencyAtBand(
-      (index + 1) / bandCount,
-      clampedMinFrequency,
-      clampedMaxFrequency,
-    );
-    const startIndex = frequencyToIndex(startFrequency, nyquist, levels.length);
-    const endIndex = Math.max(
-      startIndex + 1,
-      frequencyToIndex(endFrequency, nyquist, levels.length),
-    );
-    let total = 0;
-
-    for (let frequencyIndex = startIndex; frequencyIndex < endIndex; frequencyIndex++) {
-      total += levels[frequencyIndex] ?? 0;
-    }
-
-    const average = total / Math.max(1, endIndex - startIndex) / 255;
-    return Math.max(0, Math.min(1, average * 1.9));
-  });
-}
-
-function frequencyAtBand(progress: number, minFrequency: number, maxFrequency: number) {
-  const minLog = Math.log10(minFrequency);
-  const maxLog = Math.log10(maxFrequency);
-  return 10 ** (minLog + (maxLog - minLog) * progress);
-}
-
-function frequencyToIndex(frequency: number, nyquist: number, levelCount: number) {
-  const normalized = Math.max(0, Math.min(1, frequency / nyquist));
-  return Math.max(0, Math.min(levelCount - 1, Math.floor(normalized * levelCount)));
 }
 
 function connectMonoOutput(audioContext: AudioContext, source: AudioNode) {

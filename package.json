@@ -8,7 +8,12 @@
     "build": "tsc -b && vite build",
     "build:figma": "node figma-plugin/build.mjs",
     "preview": "vite preview --host 0.0.0.0",
-    "verify:canvas": "node scripts/verify-canvas.mjs"
+    "verify:canvas": "node scripts/verify-canvas.mjs",
+    "verify:gallery": "node scripts/verify-gallery-persistence.mjs",
+    "verify:video": "node scripts/verify-video-export.mjs",
+    "verify:video:endurance": "node scripts/verify-video-export.mjs --endurance",
+    "verify:video:endurance:mp4": "node scripts/verify-video-export.mjs --endurance --format=mp4",
+    "verify:video:endurance:all": "node scripts/verify-video-export.mjs --endurance --all-formats"
   },
   "dependencies": {
     "@radix-ui/react-slider": "^1.3.6",
@@ -16,6 +21,7 @@
     "class-variance-authority": "^0.7.1",
     "clsx": "^2.1.1",
     "lucide-react": "^1.8.0",
+    "mediabunny": "^1.51.0",
     "react": "^19.2.5",
     "react-dom": "^19.2.5",
     "tailwind-merge": "^3.5.0",

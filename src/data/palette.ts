@@ -41,12 +41,14 @@ export const paletteGroups: ColorPalette[] = [
 export const paletteColors: PaletteColor[] = paletteGroups[0].colors;
 
 export const initialBackgroundColor = "#f4f1f3";
+export const presetAudioReactivity = 45;
+export const presetAudioSmoothness = 18;
 export const fixedGrainMixer = 0.05;
 export const fixedGrainOverlay = 0;
 
 export const initialMesh: MeshConfig = {
-  audioReactivity: 5.5,
-  audioSmoothness: 5,
+  audioReactivity: presetAudioReactivity,
+  audioSmoothness: presetAudioSmoothness,
   distortion: 0.54,
   frame: 428834.2979991424,
   grainMixer: fixedGrainMixer,

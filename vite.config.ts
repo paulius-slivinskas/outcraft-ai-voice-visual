@@ -1,20 +1,38 @@
 import { defineConfig } from "vite";
 import react from "@vitejs/plugin-react";
 import tailwindcss from "@tailwindcss/vite";
-import { mkdir, readFile, rename, writeFile } from "node:fs/promises";
+import { mkdir, writeFile } from "node:fs/promises";
 import { dirname, resolve } from "node:path";
 import type { IncomingMessage, ServerResponse } from "node:http";
 import type { Connect, Plugin } from "vite";
-
-const defaultGalleryState = {
-  items: [],
-  sections: [{ id: "favorites", isOpen: true, name: "Favorites" }],
-};
+import {
+  GalleryLockTimeoutError,
+  GalleryPersistence,
+  GallerySchemaError,
+  type GallerySnapshot,
+} from "./server/galleryPersistence";
 
 const galleryFilePath = resolve(
   process.cwd(),
   process.env.OUTCRAFT_GALLERY_FILE ?? "data/gallery.json",
 );
+const galleryPersistence = new GalleryPersistence(galleryFilePath, {
+  lockHeartbeatMs: readPositiveIntegerEnvironmentValue(
+    "OUTCRAFT_GALLERY_LOCK_HEARTBEAT_MS",
+  ),
+  lockRetryMs: readPositiveIntegerEnvironmentValue(
+    "OUTCRAFT_GALLERY_LOCK_RETRY_MS",
+  ),
+  lockStaleMs: readPositiveIntegerEnvironmentValue(
+    "OUTCRAFT_GALLERY_LOCK_STALE_MS",
+  ),
+  lockTimeoutMs: readPositiveIntegerEnvironmentValue(
+    "OUTCRAFT_GALLERY_LOCK_TIMEOUT_MS",
+  ),
+});
+const galleryRequestBodyLimit =
+  readPositiveIntegerEnvironmentValue("OUTCRAFT_GALLERY_BODY_LIMIT_BYTES") ??
+  64 * 1024 * 1024;
 const githubRepositoryName = process.env.GITHUB_REPOSITORY?.split("/")[1];
 const basePath =
   process.env.GITHUB_PAGES === "true" && githubRepositoryName
@@ -35,7 +53,11 @@ export default defineConfig({
   server: {
     port: 5180,
     watch: {
-      ignored: ["**/data/gallery.json", "**/data/gallery.json.tmp"],
+      ignored: [
+        "**/data/gallery*.json",
+        "**/data/gallery*.lock",
+        "**/data/gallery*.tmp",
+      ],
     },
   },
 });
@@ -72,13 +94,15 @@ function staticGalleryBuildPlugin(): Plugin {
       outDir = resolve(config.root, config.build.outDir);
     },
     async closeBundle() {
-      const gallery = await readFile(galleryFilePath, "utf8").catch(() =>
-        `${JSON.stringify(defaultGalleryState, null, 2)}\n`,
-      );
+      const { state } = await galleryPersistence.readSnapshot();
       const outputPath = resolve(outDir, "data/gallery.json");
 
       await mkdir(dirname(outputPath), { recursive: true });
-      await writeFile(outputPath, gallery.endsWith("\n") ? gallery : `${gallery}\n`, "utf8");
+      await writeFile(
+        outputPath,
+        `${JSON.stringify(state, null, 2)}\n`,
+        "utf8",
+      );
     },
   };
 }
@@ -89,82 +113,202 @@ async function handleGalleryRequest(
 ) {
   try {
     if (request.method === "GET") {
-      sendJson(response, 200, await readGalleryFile());
+      const snapshot = await galleryPersistence.readSnapshot();
+
+      sendJson(
+        response,
+        200,
+        snapshot.state,
+        createGalleryResponseHeaders(snapshot),
+      );
       return;
     }
 
     if (request.method === "PUT") {
-      const body = await readRequestBody(request);
-      const nextGalleryState = JSON.parse(body) as unknown;
+      const ifMatch = readIfMatchHeader(request);
 
-      if (!isGalleryState(nextGalleryState)) {
-        sendJson(response, 400, { error: "Invalid gallery state." });
+      if (!ifMatch) {
+        sendJson(
+          response,
+          428,
+          { error: "If-Match is required for gallery writes." },
+          noStoreHeaders(),
+        );
         return;
       }
 
-      await writeGalleryFile(nextGalleryState);
-      sendJson(response, 200, { ok: true });
+      const body = await readRequestBody(request, galleryRequestBodyLimit);
+      let nextGalleryState: unknown;
+
+      try {
+        nextGalleryState = JSON.parse(body) as unknown;
+      } catch {
+        sendJson(
+          response,
+          400,
+          { error: "Gallery request body must be valid JSON." },
+          noStoreHeaders(),
+        );
+        return;
+      }
+
+      const result = await galleryPersistence.writeIfMatch(
+        nextGalleryState,
+        ifMatch,
+      );
+      const headers = createGalleryResponseHeaders(result.snapshot);
+
+      if (result.kind === "conflict") {
+        sendJson(
+          response,
+          409,
+          {
+            error: "Gallery changed since it was loaded.",
+            state: result.snapshot.state,
+          },
+          headers,
+        );
+        return;
+      }
+
+      sendJson(
+        response,
+        200,
+        { ok: true, state: result.snapshot.state },
+        headers,
+      );
       return;
     }
 
-    response.statusCode = 405;
-    response.setHeader("Allow", "GET, PUT");
-    response.end();
+    sendJson(
+      response,
+      405,
+      { error: "Method not allowed." },
+      { ...noStoreHeaders(), Allow: "GET, PUT" },
+    );
   } catch (error) {
-    sendJson(response, 500, {
-      error: error instanceof Error ? error.message : "Gallery file error.",
-    });
+    if (error instanceof GallerySchemaError) {
+      sendJson(
+        response,
+        400,
+        { error: error.message },
+        noStoreHeaders(),
+      );
+      return;
+    }
+
+    if (error instanceof RequestBodyTooLargeError) {
+      sendJson(
+        response,
+        413,
+        { error: error.message },
+        noStoreHeaders(),
+      );
+      return;
+    }
+
+    if (error instanceof GalleryLockTimeoutError) {
+      sendJson(
+        response,
+        503,
+        { error: "Gallery is busy. Retry the save." },
+        { ...noStoreHeaders(), "Retry-After": "1" },
+      );
+      return;
+    }
+
+    sendJson(
+      response,
+      500,
+      {
+        error: error instanceof Error ? error.message : "Gallery file error.",
+      },
+      noStoreHeaders(),
+    );
   }
 }
 
-async function readGalleryFile() {
-  try {
-    const contents = await readFile(galleryFilePath, "utf8");
-    const parsedContents = JSON.parse(contents) as unknown;
-
-    return isGalleryState(parsedContents) ? parsedContents : defaultGalleryState;
-  } catch {
-    await writeGalleryFile(defaultGalleryState);
-    return defaultGalleryState;
+class RequestBodyTooLargeError extends Error {
+  constructor(limit: number) {
+    super(`Gallery request body exceeds the ${limit}-byte limit.`);
+    this.name = "RequestBodyTooLargeError";
   }
 }
 
-async function writeGalleryFile(galleryState: unknown) {
-  await mkdir(dirname(galleryFilePath), { recursive: true });
+async function readRequestBody(request: IncomingMessage, limit: number) {
+  const contentLength = Number(request.headers["content-length"]);
 
-  const temporaryPath = `${galleryFilePath}.tmp`;
-  await writeFile(
-    temporaryPath,
-    `${JSON.stringify(galleryState, null, 2)}\n`,
-    "utf8",
-  );
-  await rename(temporaryPath, galleryFilePath);
-}
+  if (Number.isFinite(contentLength) && contentLength > limit) {
+    throw new RequestBodyTooLargeError(limit);
+  }
 
-async function readRequestBody(request: IncomingMessage) {
   const chunks: Buffer[] = [];
+  let byteLength = 0;
 
   for await (const chunk of request) {
-    chunks.push(Buffer.isBuffer(chunk) ? chunk : Buffer.from(chunk));
+    const buffer = Buffer.isBuffer(chunk) ? chunk : Buffer.from(chunk);
+
+    byteLength += buffer.length;
+
+    if (byteLength > limit) {
+      throw new RequestBodyTooLargeError(limit);
+    }
+
+    chunks.push(buffer);
   }
 
-  return Buffer.concat(chunks).toString("utf8");
+  return Buffer.concat(chunks, byteLength).toString("utf8");
 }
 
-function sendJson(response: ServerResponse, status: number, data: unknown) {
+function readIfMatchHeader(request: IncomingMessage) {
+  const value = request.headers["if-match"];
+
+  return Array.isArray(value) ? value.join(",") : value?.trim();
+}
+
+function createGalleryResponseHeaders(snapshot: GallerySnapshot) {
+  return {
+    ...noStoreHeaders(),
+    ETag: snapshot.etag,
+    "X-Outcraft-Gallery-Source": snapshot.source,
+  };
+}
+
+function noStoreHeaders() {
+  return {
+    "Cache-Control": "no-store",
+    Pragma: "no-cache",
+  };
+}
+
+function sendJson(
+  response: ServerResponse,
+  status: number,
+  data: unknown,
+  headers: Record<string, string>,
+) {
   response.statusCode = status;
-  response.setHeader("Content-Type", "application/json");
+  response.setHeader("Content-Type", "application/json; charset=utf-8");
+
+  for (const [name, value] of Object.entries(headers)) {
+    response.setHeader(name, value);
+  }
+
   response.end(JSON.stringify(data));
 }
 
-function isGalleryState(value: unknown): value is typeof defaultGalleryState {
-  return (
-    isRecord(value) &&
-    Array.isArray(value.items) &&
-    Array.isArray(value.sections)
-  );
-}
+function readPositiveIntegerEnvironmentValue(name: string) {
+  const rawValue = process.env[name];
 
-function isRecord(value: unknown): value is Record<string, unknown> {
-  return typeof value === "object" && value !== null;
+  if (rawValue === undefined) {
+    return undefined;
+  }
+
+  const value = Number(rawValue);
+
+  if (!Number.isSafeInteger(value) || value <= 0) {
+    throw new Error(`${name} must be a positive integer.`);
+  }
+
+  return value;
 }

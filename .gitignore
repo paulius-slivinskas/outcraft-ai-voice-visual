@@ -1,6 +1,13 @@
 node_modules
 dist
 test-artifacts
+data/gallery.backup.json
+data/gallery*.corrupt.*.json
+data/gallery.lock
+data/gallery.lock.reclaim
+data/gallery.lock.stale.*
+data/gallery.recovery.json
+data/gallery*.tmp
 .DS_Store
 *.local
 .env

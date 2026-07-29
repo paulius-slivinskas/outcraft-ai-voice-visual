@@ -89,6 +89,7 @@ export type VisualSnapshot = {
   mesh: MeshConfig;
   name: string;
   overlay: VisualOverlay;
+  renderVersion?: 1 | 2;
   sectionId: string;
   thumbnail: string;
 };
